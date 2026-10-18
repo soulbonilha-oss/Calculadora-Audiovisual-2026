@@ -41,6 +41,9 @@ import {
   formatBRL,
   formatHours,
   parseHoursAndMinutes,
+  parseAndValidateQuantity,
+  validateCashDiscount,
+  calculateMaterialItemCost,
 } from '../../financial/engine';
 import { generateCommercialProposalPdf, sanitizeFileName } from '../../utils/pdfGenerator';
 import { StatusLabel } from '../dashboard/DashboardView';
@@ -185,7 +188,7 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
     let totalDirect = 0;
     for (const ex of budget.expenses || []) {
       if (ex.accountingMethod === 'direct_project') {
-        const cost = (Number(ex.unitValue) || 0) * (Number(ex.quantity) || 1);
+        const cost = calculateMaterialItemCost(Number(ex.unitValue) || 0, ex.quantity);
         totalDirect += cost;
       }
     }
@@ -1102,11 +1105,13 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
                         <td className="py-2.5 px-4">
                           <input
                             type="number"
-                            min="1"
+                            min="0"
                             value={item.quantity}
                             onChange={(e) => {
                               const updated = [...(budget.professionals || [])];
-                              updated[idx].quantity = parseInt(e.target.value) || 1;
+                              const val = e.target.value;
+                              const parsed = val === '' ? 0 : parseInt(val, 10);
+                              updated[idx].quantity = isNaN(parsed) ? 0 : Math.max(0, parsed);
                               setBudget({ ...budget, professionals: updated });
                               setSaveStatus('dirty');
                             }}
@@ -1116,11 +1121,14 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
                         <td className="py-2.5 px-4">
                           <input
                             type="number"
-                            min="1"
+                            min="0"
+                            step="0.5"
                             value={item.hoursOrDays}
                             onChange={(e) => {
                               const updated = [...(budget.professionals || [])];
-                              updated[idx].hoursOrDays = parseFloat(e.target.value) || 1;
+                              const val = e.target.value;
+                              const parsed = val === '' ? 0 : parseFloat(val);
+                              updated[idx].hoursOrDays = isNaN(parsed) ? 0 : Math.max(0, parsed);
                               setBudget({ ...budget, professionals: updated });
                               setSaveStatus('dirty');
                             }}
@@ -1253,7 +1261,7 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {(budget.expenses || []).map((item, idx) => {
-                    const cost = (Number(item.unitValue) || 0) * (Number(item.quantity) || 1);
+                    const cost = calculateMaterialItemCost(Number(item.unitValue) || 0, item.quantity);
 
                     return (
                       <tr key={idx} className="hover:bg-slate-50/50">
@@ -1276,11 +1284,13 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
                         <td className="py-2.5 px-4">
                           <input
                             type="number"
-                            min="1"
+                            min="0"
                             value={item.quantity}
                             onChange={(e) => {
                               const updated = [...(budget.expenses || [])];
-                              updated[idx].quantity = parseInt(e.target.value) || 1;
+                              const val = e.target.value;
+                              const parsed = val === '' ? 0 : parseInt(val, 10);
+                              updated[idx].quantity = isNaN(parsed) ? 0 : Math.max(0, parsed);
                               setBudget({ ...budget, expenses: updated });
                               setSaveStatus('dirty');
                             }}
@@ -1577,20 +1587,33 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
                   type="number"
                   step="1"
                   min="0"
-                  max="40"
+                  max="100"
                   value={budget.pricingConfig?.cashDiscountPct ?? 10}
                   onChange={(e) => {
+                    const val = e.target.value;
+                    const parsed = val === '' ? 0 : parseFloat(val);
                     setBudget({
                       ...budget,
                       pricingConfig: {
                         ...(budget.pricingConfig as any),
-                        cashDiscountPct: parseFloat(e.target.value) || 0,
+                        cashDiscountPct: isNaN(parsed) ? 0 : parsed,
                       },
                     });
                     setSaveStatus('dirty');
                   }}
-                  className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-700"
+                  className={`w-full px-3 py-2 text-xs font-mono border rounded-lg focus:ring-1 focus:ring-emerald-700 ${
+                    budget.pricingConfig?.cashDiscountPct !== undefined &&
+                    (budget.pricingConfig.cashDiscountPct < 0 || budget.pricingConfig.cashDiscountPct > 100)
+                      ? 'border-red-400 bg-red-50 text-red-900'
+                      : 'border-slate-200'
+                  }`}
                 />
+                {budget.pricingConfig?.cashDiscountPct !== undefined &&
+                  (budget.pricingConfig.cashDiscountPct < 0 || budget.pricingConfig.cashDiscountPct > 100) && (
+                    <p className="text-[10px] text-red-600 mt-1 font-medium">
+                      O percentual deve estar estritamente entre 0% e 100%.
+                    </p>
+                  )}
               </div>
 
               <div>
@@ -1600,14 +1623,16 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
                 <input
                   type="number"
                   min="1"
-                  max="12"
+                  max="24"
                   value={budget.pricingConfig?.installmentCount ?? 4}
                   onChange={(e) => {
+                    const val = e.target.value;
+                    const parsed = val === '' ? 1 : parseInt(val, 10);
                     setBudget({
                       ...budget,
                       pricingConfig: {
                         ...(budget.pricingConfig as any),
-                        installmentCount: parseInt(e.target.value) || 1,
+                        installmentCount: isNaN(parsed) || parsed < 1 ? 1 : Math.min(60, parsed),
                       },
                     });
                     setSaveStatus('dirty');

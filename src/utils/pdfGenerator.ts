@@ -206,6 +206,11 @@ export function generateCommercialProposalPdf(data: CommercialProposalData): jsP
   const halfWidth = (contentWidth - 6) / 2;
 
   // Card Condição À Vista
+  const hasCashDiscount = (data.cashDiscountPct || 0) > 0;
+  const cashTitle = hasCashDiscount
+    ? `PAGAMENTO À VISTA (${data.cashDiscountPct}% DE DESCONTO)`
+    : 'PAGAMENTO À VISTA (VALOR INTEGRAL)';
+
   doc.setFillColor(lightBgColor);
   doc.roundedRect(margin, currentY, halfWidth, 34, 2, 2, 'F');
   doc.setDrawColor(primaryColor);
@@ -215,7 +220,7 @@ export function generateCommercialProposalPdf(data: CommercialProposalData): jsP
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(8.5);
   doc.setTextColor(primaryColor);
-  doc.text(`PAGAMENTO À VISTA (${data.cashDiscountPct}% DE DESCONTO)`, margin + 6, currentY + 8);
+  doc.text(cashTitle, margin + 6, currentY + 8);
 
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(16);
@@ -226,9 +231,21 @@ export function generateCommercialProposalPdf(data: CommercialProposalData): jsP
   doc.setFontSize(8);
   doc.setTextColor(mutedTextColor);
   doc.text('Transferência PIX ou TED na aprovação da proposta.', margin + 6, currentY + 25);
-  doc.text(`Economia direta de ${formatBRL(data.totalPrice - data.cashPrice)}.`, margin + 6, currentY + 29);
+  if (hasCashDiscount) {
+    doc.text(`Economia direta de ${formatBRL(Math.max(0, data.totalPrice - data.cashPrice))}.`, margin + 6, currentY + 29);
+  } else {
+    doc.text('Sem encargos adicionais ou taxas bancárias embutidas.', margin + 6, currentY + 29);
+  }
 
   // Card Condição Parcelada
+  const installmentCount = Math.max(1, data.installmentCount || 1);
+  const installmentTitle = installmentCount === 1
+    ? 'PAGAMENTO EM PARCELA ÚNICA'
+    : `PARCELAMENTO EM ${installmentCount}X SEM JUROS`;
+  const installmentText = installmentCount === 1
+    ? formatBRL(data.totalPrice)
+    : `${installmentCount}x de ${formatBRL(data.installmentValue)}`;
+
   doc.setFillColor(lightBgColor);
   doc.roundedRect(margin + halfWidth + 6, currentY, halfWidth, 34, 2, 2, 'F');
   doc.setDrawColor(cardBorderColor);
@@ -238,12 +255,12 @@ export function generateCommercialProposalPdf(data: CommercialProposalData): jsP
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(8.5);
   doc.setTextColor(darkTextColor);
-  doc.text(`PARCELAMENTO EM ${data.installmentCount}X SEM JUROS`, margin + halfWidth + 12, currentY + 8);
+  doc.text(installmentTitle, margin + halfWidth + 12, currentY + 8);
 
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(16);
   doc.setTextColor(darkTextColor);
-  doc.text(`${data.installmentCount}x de ${formatBRL(data.installmentValue)}`, margin + halfWidth + 12, currentY + 18);
+  doc.text(installmentText, margin + halfWidth + 12, currentY + 18);
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8);

@@ -1,13 +1,17 @@
 import express, { Request, Response } from 'express';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { getDb, DB_PATH } from './db.js';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { getDb, DB_PATH, clearSampleData, restoreSampleData } from './db.js';
 import {
   calculateEquipmentDepreciation,
   calculateOwnLabor,
   calculateOverheadAllocation,
   calculateThirdPartyCost,
   calculateProjectPricing,
+  validateCashDiscount,
+  parseAndValidateQuantity,
 } from '../src/financial/engine.js';
 
 export const apiRouter = express.Router();
@@ -33,6 +37,10 @@ apiRouter.put('/settings', (req: Request, res: Response) => {
     const db = getDb();
     const body = req.body;
     const now = new Date().toISOString();
+
+    const cashDiscountRes = validateCashDiscount(body.default_cash_discount_pct);
+    const validCashDiscount = cashDiscountRes.isValid ? cashDiscountRes.value : 10.0;
+    const validInstallments = Math.max(1, Math.min(60, Math.floor(Number(body.default_installments) || 4)));
 
     db.prepare(`
       UPDATE settings SET
@@ -76,9 +84,9 @@ apiRouter.put('/settings', (req: Request, res: Response) => {
       Number(body.default_tax_pct) || 6.0,
       Number(body.default_financial_fee_pct) || 2.5,
       Number(body.default_fixed_fee) || 0.0,
-      Number(body.default_cash_discount_pct) || 10.0,
-      Number(body.default_installments) || 4,
-      Number(body.proposal_valid_days) || 7,
+      validCashDiscount,
+      validInstallments,
+      Math.max(1, Number(body.proposal_valid_days) || 7),
       body.default_notes ?? '',
       body.terms_and_conditions ?? '',
       now
@@ -935,11 +943,14 @@ apiRouter.post('/budgets/:id/emit-proposal', (req: Request, res: Response) => {
     };
 
     const calculatedSummary = JSON.parse(budget.calculated_summary_json || '{}');
-    const totalPrice = body.totalPrice ?? calculatedSummary.finalBasePrice ?? 0;
-    const cashDiscountPct = body.cashDiscountPct ?? settings?.default_cash_discount_pct ?? 10;
-    const cashPrice = body.cashPrice ?? totalPrice * (1 - cashDiscountPct / 100);
-    const installmentCount = body.installmentCount ?? settings?.default_installments ?? 4;
-    const installmentValue = totalPrice / installmentCount;
+    const totalPrice = Math.max(0, Number(body.totalPrice ?? calculatedSummary.finalBasePrice) || 0);
+
+    const discountRes = validateCashDiscount(body.cashDiscountPct ?? settings?.default_cash_discount_pct ?? 10);
+    const cashDiscountPct = discountRes.isValid ? discountRes.value : 10;
+    const cashPrice = Math.max(0, Number((totalPrice * (1 - cashDiscountPct / 100)).toFixed(2)));
+
+    const installmentCount = Math.max(1, Math.min(60, Math.floor(Number(body.installmentCount ?? settings?.default_installments) || 4)));
+    const installmentValue = Number((totalPrice / installmentCount).toFixed(2));
 
     const issuerContact = {
       studioName: settings?.studio_name ?? 'FBonilha.mov',
@@ -990,9 +1001,317 @@ apiRouter.post('/budgets/:id/emit-proposal', (req: Request, res: Response) => {
   }
 });
 
+// Consultas de Propostas Comerciais Emitidas (Histórico Imutável)
+apiRouter.get('/proposals', (req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    const rows = db.prepare('SELECT * FROM proposals ORDER BY created_at DESC').all();
+    const parsed = rows.map((r: any) => ({
+      ...r,
+      stageHoursSummary: JSON.parse(r.stage_hours_summary_json || '{}'),
+      issuerContact: JSON.parse(r.issuer_contact_json || '{}'),
+    }));
+    res.json(parsed);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+apiRouter.get('/budgets/:id/proposals', (req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    const budgetId = req.params.id;
+    const rows = db.prepare('SELECT * FROM proposals WHERE budget_id = ? ORDER BY created_at DESC').all(budgetId);
+    const parsed = rows.map((r: any) => ({
+      ...r,
+      stageHoursSummary: JSON.parse(r.stage_hours_summary_json || '{}'),
+      issuerContact: JSON.parse(r.issuer_contact_json || '{}'),
+    }));
+    res.json(parsed);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+apiRouter.get('/proposals/:id', (req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    const id = req.params.id;
+    const r = db.prepare('SELECT * FROM proposals WHERE id = ?').get(id) as any;
+    if (!r) return res.status(404).json({ error: 'Proposta não encontrada.' });
+    res.json({
+      ...r,
+      stageHoursSummary: JSON.parse(r.stage_hours_summary_json || '{}'),
+      issuerContact: JSON.parse(r.issuer_contact_json || '{}'),
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Gerenciamento de Dados de Demonstração (Permite base vazia sem contaminar dados do usuário)
+apiRouter.post('/demo/clear-samples', (req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    clearSampleData(db);
+    res.json({ success: true, message: 'Dados demonstrativos removidos. A base contém agora exclusivamente cadastros criados por você.' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+apiRouter.post('/demo/restore-samples', (req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    restoreSampleData(db);
+    res.json({ success: true, message: 'Dados de demonstração restaurados com sucesso.' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==========================================
 // 8. BACKUP, EXPORTAÇÃO E RESTAURAÇÃO
 // ==========================================
+
+export interface BackupValidationReport {
+  isValid: boolean;
+  errors: string[];
+  warnings: string[];
+  summary: {
+    equipmentCount: number;
+    recurringExpensesCount: number;
+    catalogCount: number;
+    professionalsCount: number;
+    templatesCount: number;
+    budgetsCount: number;
+    proposalsCount: number;
+  };
+}
+
+export function validateBackupPayload(payload: any, currentDb?: any): BackupValidationReport {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const summary = {
+    equipmentCount: 0,
+    recurringExpensesCount: 0,
+    catalogCount: 0,
+    professionalsCount: 0,
+    templatesCount: 0,
+    budgetsCount: 0,
+    proposalsCount: 0,
+  };
+
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return {
+      isValid: false,
+      errors: ['O arquivo de backup deve ser um objeto JSON válido.'],
+      warnings: [],
+      summary,
+    };
+  }
+
+  // Verificar versão do esquema
+  const schemaVersion = payload.schema_version ?? (payload.version ? 1 : null);
+  if (schemaVersion === null) {
+    warnings.push('Versão de esquema ausente no arquivo; assumindo formato compatível v1.');
+  }
+
+  if (!payload.data || typeof payload.data !== 'object' || Array.isArray(payload.data)) {
+    return {
+      isValid: false,
+      errors: ['O arquivo de backup não contém a propriedade "data" estruturada.'],
+      warnings,
+      summary,
+    };
+  }
+
+  const data = payload.data;
+
+  // Validação de Equipamentos
+  if (data.equipment !== undefined) {
+    if (!Array.isArray(data.equipment)) {
+      errors.push('A entidade "equipment" deve ser uma lista (array).');
+    } else {
+      summary.equipmentCount = data.equipment.length;
+      const seenIds = new Set<string>();
+      data.equipment.forEach((item: any, idx: number) => {
+        if (!item || typeof item !== 'object') {
+          errors.push(`Equipamento na posição ${idx} não é um objeto válido.`);
+          return;
+        }
+        if (!item.id || typeof item.id !== 'string') {
+          errors.push(`Equipamento na posição ${idx} possui identificador (id) inválido.`);
+        } else if (seenIds.has(item.id)) {
+          errors.push(`ID duplicado em equipamentos: "${item.id}".`);
+        } else {
+          seenIds.add(item.id);
+        }
+        if (!item.name || typeof item.name !== 'string') {
+          errors.push(`Equipamento "${item.id || idx}" possui nome obrigatório ausente.`);
+        }
+        if (item.purchase_value !== undefined && (isNaN(Number(item.purchase_value)) || Number(item.purchase_value) < 0)) {
+          errors.push(`Equipamento "${item.name || idx}" possui valor de compra numérico inválido.`);
+        }
+      });
+    }
+  }
+
+  // Validação de Custos Fixos
+  if (data.recurring_expenses !== undefined) {
+    if (!Array.isArray(data.recurring_expenses)) {
+      errors.push('A entidade "recurring_expenses" deve ser uma lista.');
+    } else {
+      summary.recurringExpensesCount = data.recurring_expenses.length;
+      const seenIds = new Set<string>();
+      data.recurring_expenses.forEach((item: any, idx: number) => {
+        if (!item || typeof item !== 'object') {
+          errors.push(`Custo fixo na posição ${idx} não é um objeto válido.`);
+          return;
+        }
+        if (!item.id || typeof item.id !== 'string') {
+          errors.push(`Custo fixo na posição ${idx} possui ID inválido.`);
+        } else if (seenIds.has(item.id)) {
+          errors.push(`ID duplicado em custos fixos: "${item.id}".`);
+        } else {
+          seenIds.add(item.id);
+        }
+        if (!item.name) errors.push(`Custo fixo "${item.id || idx}" possui nome ausente.`);
+      });
+    }
+  }
+
+  // Validação de Catálogo
+  if (data.expense_catalog !== undefined) {
+    if (!Array.isArray(data.expense_catalog)) {
+      errors.push('A entidade "expense_catalog" deve ser uma lista.');
+    } else {
+      summary.catalogCount = data.expense_catalog.length;
+      const seenIds = new Set<string>();
+      data.expense_catalog.forEach((item: any, idx: number) => {
+        if (!item.id || typeof item.id !== 'string') {
+          errors.push(`Item de catálogo na posição ${idx} possui ID inválido.`);
+        } else if (seenIds.has(item.id)) {
+          errors.push(`ID duplicado em catálogo de despesas: "${item.id}".`);
+        } else {
+          seenIds.add(item.id);
+        }
+      });
+    }
+  }
+
+  // Validação de Profissionais
+  if (data.professionals !== undefined) {
+    if (!Array.isArray(data.professionals)) {
+      errors.push('A entidade "professionals" deve ser uma lista.');
+    } else {
+      summary.professionalsCount = data.professionals.length;
+      const seenIds = new Set<string>();
+      data.professionals.forEach((item: any, idx: number) => {
+        if (!item.id || typeof item.id !== 'string') {
+          errors.push(`Profissional na posição ${idx} possui ID inválido.`);
+        } else if (seenIds.has(item.id)) {
+          errors.push(`ID duplicado em profissionais: "${item.id}".`);
+        } else {
+          seenIds.add(item.id);
+        }
+      });
+    }
+  }
+
+  // Validação de Modelos
+  if (data.production_templates !== undefined) {
+    if (!Array.isArray(data.production_templates)) {
+      errors.push('A entidade "production_templates" deve ser uma lista.');
+    } else {
+      summary.templatesCount = data.production_templates.length;
+      const seenIds = new Set<string>();
+      data.production_templates.forEach((item: any, idx: number) => {
+        if (!item.id || typeof item.id !== 'string') {
+          errors.push(`Modelo na posição ${idx} possui ID inválido.`);
+        } else if (seenIds.has(item.id)) {
+          errors.push(`ID duplicado em modelos: "${item.id}".`);
+        } else {
+          seenIds.add(item.id);
+        }
+      });
+    }
+  }
+
+  // Validação de Orçamentos
+  const budgetIdsInBackup = new Set<string>();
+  if (data.budgets !== undefined) {
+    if (!Array.isArray(data.budgets)) {
+      errors.push('A entidade "budgets" deve ser uma lista.');
+    } else {
+      summary.budgetsCount = data.budgets.length;
+      data.budgets.forEach((item: any, idx: number) => {
+        if (!item || typeof item !== 'object') {
+          errors.push(`Orçamento na posição ${idx} não é um objeto válido.`);
+          return;
+        }
+        if (!item.id || typeof item.id !== 'string') {
+          errors.push(`Orçamento na posição ${idx} possui ID inválido.`);
+        } else if (budgetIdsInBackup.has(item.id)) {
+          errors.push(`ID duplicado em orçamentos: "${item.id}".`);
+        } else {
+          budgetIdsInBackup.add(item.id);
+        }
+        if (!item.title) errors.push(`Orçamento "${item.id || idx}" possui título ausente.`);
+        if (!item.client_name) errors.push(`Orçamento "${item.id || idx}" possui nome do cliente ausente.`);
+      });
+    }
+  }
+
+  // Validação de Propostas e Integridade Referencial
+  if (data.proposals !== undefined) {
+    if (!Array.isArray(data.proposals)) {
+      errors.push('A entidade "proposals" deve ser uma lista.');
+    } else {
+      summary.proposalsCount = data.proposals.length;
+      const seenProposalIds = new Set<string>();
+      data.proposals.forEach((item: any, idx: number) => {
+        if (!item || typeof item !== 'object') {
+          errors.push(`Proposta na posição ${idx} não é um objeto válido.`);
+          return;
+        }
+        if (!item.id || typeof item.id !== 'string') {
+          errors.push(`Proposta na posição ${idx} possui ID inválido.`);
+        } else if (seenProposalIds.has(item.id)) {
+          errors.push(`ID duplicado em propostas: "${item.id}".`);
+        } else {
+          seenProposalIds.add(item.id);
+        }
+
+        // Checar integridade referencial: proposta deve apontar para orçamento
+        if (!item.budget_id || typeof item.budget_id !== 'string') {
+          errors.push(`Proposta "${item.id || idx}" não possui referência de orçamento (budget_id).`);
+        } else if (!budgetIdsInBackup.has(item.budget_id)) {
+          if (currentDb) {
+            const exists = currentDb.prepare('SELECT id FROM budgets WHERE id = ?').get(item.budget_id);
+            if (!exists) {
+              errors.push(`Proposta "${item.id}" faz referência a orçamento inexistente ("${item.budget_id}").`);
+            }
+          } else {
+            warnings.push(`Proposta "${item.id}" faz referência a orçamento "${item.budget_id}" ausente no backup.`);
+          }
+        }
+
+        if (item.total_price !== undefined && (isNaN(Number(item.total_price)) || Number(item.total_price) < 0)) {
+          errors.push(`Proposta "${item.id || idx}" possui valor total monetário negativo ou inválido.`);
+        }
+      });
+    }
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+    warnings,
+    summary,
+  };
+}
+
 apiRouter.get('/backup/export-json', (req: Request, res: Response) => {
   try {
     const db = getDb();
@@ -1006,9 +1325,9 @@ apiRouter.get('/backup/export-json', (req: Request, res: Response) => {
     const proposals = db.prepare('SELECT * FROM proposals').all();
 
     const backupData = {
-      app: 'FBonilha Audiovisual',
-      version: '1.0.0',
-      schema_version: 1,
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 3,
       exported_at: new Date().toISOString(),
       data: {
         settings,
@@ -1030,14 +1349,36 @@ apiRouter.get('/backup/export-json', (req: Request, res: Response) => {
   }
 });
 
+// Exportação SQLite Atômica e Confiável em WAL Mode via VACUUM INTO
 apiRouter.get('/backup/export-sqlite', (req: Request, res: Response) => {
+  let tempBackupPath = '';
   try {
-    if (!fs.existsSync(DB_PATH)) {
-      return res.status(404).json({ error: 'Arquivo SQLite não encontrado.' });
+    const db = getDb();
+    tempBackupPath = path.resolve('/tmp', `fbonilha_backup_${crypto.randomUUID()}.sqlite`);
+
+    // SQLite nativo VACUUM INTO cria um snapshot consistente e completo independente de WAL
+    db.exec(`VACUUM INTO '${tempBackupPath.replace(/'/g, "''")}';`);
+
+    // Validação de integridade do arquivo gerado
+    const checkDb = new DatabaseSync(tempBackupPath);
+    const checkResult = checkDb.prepare('PRAGMA integrity_check').get() as any;
+    checkDb.close();
+
+    if (checkResult?.integrity_check !== 'ok') {
+      try { fs.unlinkSync(tempBackupPath); } catch {}
+      return res.status(500).json({ error: 'Falha na verificação de integridade do banco SQLite gerado.' });
     }
-    res.download(DB_PATH, `fbonilha_${new Date().toISOString().slice(0, 10)}.sqlite`);
+
+    res.download(tempBackupPath, `fbonilha_${new Date().toISOString().slice(0, 10)}.sqlite`, (err) => {
+      if (tempBackupPath && fs.existsSync(tempBackupPath)) {
+        try { fs.unlinkSync(tempBackupPath); } catch {}
+      }
+    });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (tempBackupPath && fs.existsSync(tempBackupPath)) {
+      try { fs.unlinkSync(tempBackupPath); } catch {}
+    }
+    res.status(500).json({ error: `Erro ao exportar banco SQLite consistente: ${error.message}` });
   }
 });
 
@@ -1047,31 +1388,40 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
     const payload = req.body;
     const mode = req.query.mode || 'preview'; // 'preview' ou 'commit'
 
-    if (!payload || !payload.data) {
-      return res.status(400).json({ error: 'Arquivo JSON inválido. Estrutura não reconhecida.' });
-    }
-
-    const data = payload.data;
-    const summary = {
-      equipmentCount: data.equipment?.length || 0,
-      recurringExpensesCount: data.recurring_expenses?.length || 0,
-      catalogCount: data.expense_catalog?.length || 0,
-      professionalsCount: data.professionals?.length || 0,
-      templatesCount: data.production_templates?.length || 0,
-      budgetsCount: data.budgets?.length || 0,
-      proposalsCount: data.proposals?.length || 0,
-    };
+    const validation = validateBackupPayload(payload, db);
 
     if (mode === 'preview') {
       return res.json({
-        valid: true,
-        summary,
-        exportedAt: payload.exported_at,
-        app: payload.app,
+        valid: validation.isValid,
+        errors: validation.errors,
+        warnings: validation.warnings,
+        summary: validation.summary,
+        exportedAt: payload?.exported_at,
+        app: payload?.app,
+        version: payload?.version,
       });
     }
 
-    // Modo commit: Restaurar integralmente dentro de transação SQLite
+    if (!validation.isValid) {
+      return res.status(400).json({
+        error: 'Arquivo de backup rejeitado por falha de integridade estrutural.',
+        details: validation.errors,
+      });
+    }
+
+    const data = payload.data;
+    const summary = validation.summary;
+
+    // Criar snapshot prévio de segurança em disco antes de alterar o banco
+    try {
+      const backupDir = path.resolve(process.cwd(), 'data');
+      const safetyBackupPath = path.resolve(backupDir, `safety_pre_restore_${Date.now()}.sqlite`);
+      db.exec(`VACUUM INTO '${safetyBackupPath.replace(/'/g, "''")}';`);
+    } catch (vacuumErr) {
+      console.warn('Aviso: falha ao gerar backup prévio com VACUUM INTO:', vacuumErr);
+    }
+
+    // Modo commit: Restaurar integralmente dentro de transação SQLite com rollback
     db.exec('BEGIN TRANSACTION;');
 
     try {
@@ -1088,13 +1438,27 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
             terms_and_conditions = ?, updated_at = datetime('now')
           WHERE id = 1
         `).run(
-          s.studio_name, s.logo_url, s.primary_color, s.email, s.phone,
-          s.website, s.address, s.cnpj, s.default_hourly_rate,
-          s.default_billable_hours_month, s.default_pricing_method,
-          s.default_profit_margin_pct, s.default_markup_pct, s.default_tax_pct,
-          s.default_financial_fee_pct, s.default_fixed_fee, s.default_cash_discount_pct,
-          s.default_installments, s.proposal_valid_days, s.default_notes,
-          s.terms_and_conditions
+          s.studio_name ?? 'FBonilha.mov',
+          s.logo_url ?? '',
+          s.primary_color ?? '#4F5D47',
+          s.email ?? '',
+          s.phone ?? '',
+          s.website ?? '',
+          s.address ?? '',
+          s.cnpj ?? '',
+          Number(s.default_hourly_rate) || 150.0,
+          Number(s.default_billable_hours_month) || 100.0,
+          s.default_pricing_method ?? 'margin_on_sale',
+          Number(s.default_profit_margin_pct) || 25.0,
+          Number(s.default_markup_pct) || 35.0,
+          Number(s.default_tax_pct) || 6.0,
+          Number(s.default_financial_fee_pct) || 2.5,
+          Number(s.default_fixed_fee) || 0.0,
+          s.default_cash_discount_pct !== undefined ? Number(s.default_cash_discount_pct) : 10.0,
+          Number(s.default_installments) || 4,
+          Number(s.proposal_valid_days) || 7,
+          s.default_notes ?? '',
+          s.terms_and_conditions ?? ''
         );
       }
 
@@ -1104,15 +1468,17 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
           INSERT OR REPLACE INTO equipment (
             id, name, category, brand, model, serial_number, acquisition_date,
             purchase_value, residual_value, useful_life_years, estimation_method,
-            total_useful_hours, annual_hours, notes, is_active, is_deleted, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            total_useful_hours, annual_hours, notes, is_active, is_deleted, is_sample, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         for (const e of data.equipment) {
           insertEq.run(
             e.id, e.name, e.category, e.brand ?? '', e.model ?? '', e.serial_number ?? '',
-            e.acquisition_date ?? '', e.purchase_value, e.residual_value, e.useful_life_years,
-            e.estimation_method, e.total_useful_hours, e.annual_hours, e.notes ?? '',
-            e.is_active, e.is_deleted ?? 0, e.created_at, e.updated_at
+            e.acquisition_date ?? '', Number(e.purchase_value) || 0, Number(e.residual_value) || 0,
+            Number(e.useful_life_years) || 3, e.estimation_method ?? 'total_hours',
+            Number(e.total_useful_hours) || 2500, Number(e.annual_hours) || 600, e.notes ?? '',
+            e.is_active ?? 1, e.is_deleted ?? 0, e.is_sample ?? 0,
+            e.created_at || new Date().toISOString(), e.updated_at || new Date().toISOString()
           );
         }
       }
@@ -1122,13 +1488,14 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
         const insertRec = db.prepare(`
           INSERT OR REPLACE INTO recurring_expenses (
             id, name, category, monthly_value, start_date, end_date, accounting_method,
-            notes, is_active, is_deleted, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            notes, is_active, is_deleted, is_sample, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         for (const r of data.recurring_expenses) {
           insertRec.run(
-            r.id, r.name, r.category, r.monthly_value, r.start_date ?? '', r.end_date ?? '',
-            r.accounting_method, r.notes ?? '', r.is_active, r.is_deleted ?? 0, r.created_at, r.updated_at
+            r.id, r.name, r.category, Number(r.monthly_value) || 0, r.start_date ?? '', r.end_date ?? '',
+            r.accounting_method ?? 'overhead_allocated', r.notes ?? '', r.is_active ?? 1,
+            r.is_deleted ?? 0, r.is_sample ?? 0, r.created_at || new Date().toISOString(), r.updated_at || new Date().toISOString()
           );
         }
       }
@@ -1138,14 +1505,15 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
         const insertCat = db.prepare(`
           INSERT OR REPLACE INTO expense_catalog (
             id, name, category, description, cost_type, default_value, periodicity,
-            accounting_method, notes, is_active, is_deleted, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            accounting_method, notes, is_active, is_deleted, is_sample, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         for (const c of data.expense_catalog) {
           insertCat.run(
-            c.id, c.name, c.category, c.description ?? '', c.cost_type, c.default_value,
-            c.periodicity ?? '', c.accounting_method, c.notes ?? '', c.is_active,
-            c.is_deleted ?? 0, c.created_at, c.updated_at
+            c.id, c.name, c.category, c.description ?? '', c.cost_type ?? 'per_project',
+            Number(c.default_value) || 0, c.periodicity ?? '', c.accounting_method ?? 'direct_project',
+            c.notes ?? '', c.is_active ?? 1, c.is_deleted ?? 0, c.is_sample ?? 0,
+            c.created_at || new Date().toISOString(), c.updated_at || new Date().toISOString()
           );
         }
       }
@@ -1155,13 +1523,14 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
         const insertPro = db.prepare(`
           INSERT OR REPLACE INTO professionals (
             id, name, specialty, phone, email, hiring_type, default_value,
-            notes, is_active, is_deleted, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            notes, is_active, is_deleted, is_sample, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         for (const p of data.professionals) {
           insertPro.run(
-            p.id, p.name, p.specialty, p.phone ?? '', p.email ?? '', p.hiring_type,
-            p.default_value, p.notes ?? '', p.is_active, p.is_deleted ?? 0, p.created_at, p.updated_at
+            p.id, p.name, p.specialty, p.phone ?? '', p.email ?? '', p.hiring_type ?? 'daily',
+            Number(p.default_value) || 0, p.notes ?? '', p.is_active ?? 1,
+            p.is_deleted ?? 0, p.is_sample ?? 0, p.created_at || new Date().toISOString(), p.updated_at || new Date().toISOString()
           );
         }
       }
@@ -1171,14 +1540,19 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
         const insertTpl = db.prepare(`
           INSERT OR REPLACE INTO production_templates (
             id, name, description, stages_json, equipment_json, professionals_json,
-            expenses_json, pricing_config_json, notes, is_deleted, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            expenses_json, pricing_config_json, notes, is_deleted, is_sample, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         for (const t of data.production_templates) {
           insertTpl.run(
-            t.id, t.name, t.description ?? '', t.stages_json, t.equipment_json,
-            t.professionals_json, t.expenses_json, t.pricing_config_json, t.notes ?? '',
-            t.is_deleted ?? 0, t.created_at, t.updated_at
+            t.id, t.name, t.description ?? '',
+            typeof t.stages_json === 'string' ? t.stages_json : JSON.stringify(t.stages || []),
+            typeof t.equipment_json === 'string' ? t.equipment_json : JSON.stringify(t.equipment || []),
+            typeof t.professionals_json === 'string' ? t.professionals_json : JSON.stringify(t.professionals || []),
+            typeof t.expenses_json === 'string' ? t.expenses_json : JSON.stringify(t.expenses || []),
+            typeof t.pricing_config_json === 'string' ? t.pricing_config_json : JSON.stringify(t.pricingConfig || {}),
+            t.notes ?? '', t.is_deleted ?? 0, t.is_sample ?? 0,
+            t.created_at || new Date().toISOString(), t.updated_at || new Date().toISOString()
           );
         }
       }
@@ -1199,15 +1573,52 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
             b.id, b.code, b.title, b.client_name, b.client_company ?? '', b.client_email ?? '',
             b.client_phone ?? '', b.description ?? '', b.scope_summary ?? '', b.internal_notes ?? '',
             b.responsible ?? 'FBonilha', b.status ?? 'draft', b.template_id ?? null,
-            b.stages_snapshot_json, b.equipment_snapshot_json, b.professionals_snapshot_json,
-            b.expenses_snapshot_json, b.pricing_config_json, b.calculated_summary_json,
-            b.is_deleted ?? 0, b.created_at, b.updated_at
+            typeof b.stages_snapshot_json === 'string' ? b.stages_snapshot_json : JSON.stringify(b.stages || []),
+            typeof b.equipment_snapshot_json === 'string' ? b.equipment_snapshot_json : JSON.stringify(b.equipment || []),
+            typeof b.professionals_snapshot_json === 'string' ? b.professionals_snapshot_json : JSON.stringify(b.professionals || []),
+            typeof b.expenses_snapshot_json === 'string' ? b.expenses_snapshot_json : JSON.stringify(b.expenses || []),
+            typeof b.pricing_config_json === 'string' ? b.pricing_config_json : JSON.stringify(b.pricingConfig || {}),
+            typeof b.calculated_summary_json === 'string' ? b.calculated_summary_json : JSON.stringify(b.calculatedSummary || {}),
+            b.is_deleted ?? 0, b.created_at || new Date().toISOString(), b.updated_at || new Date().toISOString()
+          );
+        }
+      }
+
+      // Restauração Integral de Propostas Comerciais (Snapshots Imutáveis de Emissão)
+      if (Array.isArray(data.proposals)) {
+        const insertProp = db.prepare(`
+          INSERT OR REPLACE INTO proposals (
+            id, budget_id, proposal_code, client_name, project_title, scope_summary,
+            stage_hours_summary_json, total_price, cash_price, cash_discount_pct,
+            installment_count, installment_value, issue_date, valid_until_date,
+            issuer_contact_json, commercial_terms, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        for (const p of data.proposals) {
+          insertProp.run(
+            p.id,
+            p.budget_id,
+            p.proposal_code,
+            p.client_name,
+            p.project_title,
+            p.scope_summary ?? '',
+            typeof p.stage_hours_summary_json === 'string' ? p.stage_hours_summary_json : JSON.stringify(p.stageHoursSummary || {}),
+            Number(p.total_price) || 0,
+            Number(p.cash_price) || 0,
+            Number(p.cash_discount_pct) || 10.0,
+            Number(p.installment_count) || 4,
+            Number(p.installment_value) || 0,
+            p.issue_date || new Date().toISOString().slice(0, 10),
+            p.valid_until_date || new Date().toISOString().slice(0, 10),
+            typeof p.issuer_contact_json === 'string' ? p.issuer_contact_json : JSON.stringify(p.issuerContact || {}),
+            p.commercial_terms ?? '',
+            p.created_at || new Date().toISOString()
           );
         }
       }
 
       db.exec('COMMIT;');
-      res.json({ success: true, message: 'Dados restaurados com sucesso.', summary });
+      res.json({ success: true, message: 'Dados e propostas restaurados com sucesso dentro de transação atômica.', summary });
     } catch (innerError: any) {
       db.exec('ROLLBACK;');
       throw innerError;

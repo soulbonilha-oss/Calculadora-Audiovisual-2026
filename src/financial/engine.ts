@@ -220,6 +220,80 @@ export function calculateOverheadAllocation(
 }
 
 /**
+ * Validação rigorosa e diferenciação de quantidades
+ * Diferencia explicitamente: campo ausente, campo vazio, zero (custo 0), positivo, negativo e não-numérico.
+ */
+export interface QuantityValidationResult {
+  value: number;
+  isValid: boolean;
+  isZero: boolean;
+  errorMessage?: string;
+}
+
+export function parseAndValidateQuantity(raw: any, defaultIfAbsent: number = 1): QuantityValidationResult {
+  if (raw === undefined || raw === null || raw === '') {
+    return { value: defaultIfAbsent, isValid: true, isZero: defaultIfAbsent === 0 };
+  }
+  const n = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (isNaN(n) || !isFinite(n)) {
+    return {
+      value: 0,
+      isValid: false,
+      isZero: true,
+      errorMessage: 'Quantidade deve ser um valor numérico válido.',
+    };
+  }
+  if (n < 0) {
+    return {
+      value: 0,
+      isValid: false,
+      isZero: false,
+      errorMessage: 'Quantidade não pode ser negativa.',
+    };
+  }
+  return { value: roundToDecimals(n, 2), isValid: true, isZero: n === 0 };
+}
+
+/**
+ * Validação de desconto à vista
+ * Faixa permitida: [0, 100]%
+ */
+export interface CashDiscountValidationResult {
+  value: number;
+  isValid: boolean;
+  errorMessage?: string;
+}
+
+export function validateCashDiscount(discountRaw: any): CashDiscountValidationResult {
+  if (discountRaw === undefined || discountRaw === null || discountRaw === '') {
+    return { value: 10, isValid: true };
+  }
+  const num = typeof discountRaw === 'number' ? discountRaw : Number(String(discountRaw).trim());
+  if (isNaN(num) || !isFinite(num)) {
+    return {
+      value: 0,
+      isValid: false,
+      errorMessage: 'O percentual de desconto à vista deve ser um número válido.',
+    };
+  }
+  if (num < 0) {
+    return {
+      value: 0,
+      isValid: false,
+      errorMessage: 'O percentual de desconto à vista não pode ser negativo.',
+    };
+  }
+  if (num > 100) {
+    return {
+      value: 100,
+      isValid: false,
+      errorMessage: 'O percentual de desconto à vista não pode ser superior a 100%.',
+    };
+  }
+  return { value: roundToDecimals(num, 2), isValid: true };
+}
+
+/**
  * Cálculo de Terceiros e Equipe
  */
 export interface ProfessionalContractCost {
@@ -231,7 +305,12 @@ export interface ProfessionalContractCost {
 }
 
 export function calculateThirdPartyCost(item: ProfessionalContractCost): number {
-  const qty = Math.max(0, Number(item.quantity) || 1);
+  const qtyResult = parseAndValidateQuantity(item.quantity, 1);
+  // Se a quantidade for zero ou inválida, o custo correspondente é zero!
+  if (!qtyResult.isValid || qtyResult.value === 0) {
+    return 0;
+  }
+  const qty = qtyResult.value;
   const unit = Math.max(0, Number(item.unitValue) || 0);
   const additional = Math.max(0, Number(item.additionalExpenses) || 0);
 
@@ -248,6 +327,15 @@ export function calculateThirdPartyCost(item: ProfessionalContractCost): number 
   }
 
   return roundToDecimals(base + additional, 2);
+}
+
+export function calculateMaterialItemCost(unitValue: number, quantity: any): number {
+  const qtyResult = parseAndValidateQuantity(quantity, 1);
+  if (!qtyResult.isValid || qtyResult.value === 0) {
+    return 0;
+  }
+  const unit = Math.max(0, Number(unitValue) || 0);
+  return roundToDecimals(unit * qtyResult.value, 2);
 }
 
 /**
@@ -426,8 +514,15 @@ export function calculateProjectPricing(
     alertMessage = `Margem efetiva (${effectiveMarginPct.toFixed(1)}%) abaixo da meta de ${(config.desiredProfitMarginPct || 0).toFixed(1)}% (diferença de ${diffPct}%). Sugerido: ${formatBRL(suggestedPriceForTargetMargin)}.`;
   }
 
-  // Simulação à vista (default 10% de desconto)
-  const cashDiscountPct = config.cashDiscountPct !== undefined ? Number(config.cashDiscountPct) : 10;
+  // Validação estrita de desconto à vista
+  const discountValidation = validateCashDiscount(config.cashDiscountPct);
+  if (!discountValidation.isValid) {
+    return createInvalidPricingResult(
+      totalCost,
+      discountValidation.errorMessage || 'Percentual de desconto à vista inválido.'
+    );
+  }
+  const cashDiscountPct = discountValidation.value;
   const cashDiscountFactor = 1 - cashDiscountPct / 100;
   const cashPrice = roundToDecimals(finalBasePrice * cashDiscountFactor, 2);
   const cashDiscountAmount = roundToDecimals(finalBasePrice - cashPrice, 2);
@@ -436,8 +531,15 @@ export function calculateProjectPricing(
   const cashProfit = roundToDecimals(cashPrice - totalCost - cashTax - cashFee, 2);
   const cashMarginPct = cashPrice > 0 ? roundToDecimals((cashProfit / cashPrice) * 100, 2) : null;
 
-  // Simulação parcelada (default 4x sem juros ao cliente)
-  const installmentCount = Math.max(1, Math.floor(Number(config.installmentCount) || 4));
+  // Simulação parcelada (validação de parcelas inteiras positivas)
+  let rawInstallments = config.installmentCount !== undefined && config.installmentCount !== null ? Number(config.installmentCount) : 4;
+  if (isNaN(rawInstallments) || rawInstallments < 1 || !Number.isInteger(rawInstallments)) {
+    return createInvalidPricingResult(
+      totalCost,
+      'A quantidade de parcelas deve ser um número inteiro maior ou igual a 1.'
+    );
+  }
+  const installmentCount = Math.min(60, rawInstallments);
   const installmentCents = Math.floor(Math.round(finalBasePrice * 100) / installmentCount);
   const remainderCents = Math.round(finalBasePrice * 100) - installmentCents * installmentCount;
 

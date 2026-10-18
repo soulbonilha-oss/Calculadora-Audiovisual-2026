@@ -230,6 +230,51 @@ function runMigrations(db: DatabaseSync) {
     db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, datetime(\'now\'))')
       .run(2, 'brand_identity_fbonilha_mov');
   }
+
+  if (!appliedVersions.has(3)) {
+    // Migration 3: Separação explícita de dados de demonstração vs dados reais do usuário
+    const tables = ['equipment', 'recurring_expenses', 'expense_catalog', 'professionals', 'production_templates'];
+    for (const table of tables) {
+      const tableInfo = db.prepare(`PRAGMA table_info(${table})`).all() as any[];
+      const hasIsSample = tableInfo.some((col: any) => col.name === 'is_sample');
+      if (!hasIsSample) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN is_sample INTEGER NOT NULL DEFAULT 0;`);
+      }
+    }
+
+    // Marcar registros iniciais com is_sample = 1
+    db.exec(`
+      UPDATE equipment SET is_sample = 1 WHERE id LIKE 'eq_%';
+      UPDATE recurring_expenses SET is_sample = 1 WHERE id LIKE 'rec_%';
+      UPDATE expense_catalog SET is_sample = 1 WHERE id LIKE 'cat_%';
+      UPDATE professionals SET is_sample = 1 WHERE id LIKE 'pro_%';
+      UPDATE production_templates SET is_sample = 1 WHERE id LIKE 'tpl_%';
+    `);
+
+    db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, datetime(\'now\'))')
+      .run(3, 'add_is_sample_flag_to_entities');
+  }
+}
+
+export function clearSampleData(db: DatabaseSync) {
+  db.exec('BEGIN TRANSACTION;');
+  try {
+    db.exec(`
+      DELETE FROM equipment WHERE is_sample = 1;
+      DELETE FROM recurring_expenses WHERE is_sample = 1;
+      DELETE FROM expense_catalog WHERE is_sample = 1;
+      DELETE FROM professionals WHERE is_sample = 1;
+      DELETE FROM production_templates WHERE is_sample = 1;
+    `);
+    db.exec('COMMIT;');
+  } catch (err) {
+    db.exec('ROLLBACK;');
+    throw err;
+  }
+}
+
+export function restoreSampleData(db: DatabaseSync) {
+  seedInitialData(db);
 }
 
 function seedInitialData(db: DatabaseSync) {

@@ -95,10 +95,10 @@ export const BudgetListView: React.FC<BudgetListViewProps> = ({
 
     const summary = b.calculatedSummary || {};
     const totalPrice = Number(summary.finalBasePrice) || 0;
-    const cashDiscountPct = b.pricingConfig?.cashDiscountPct || 10;
-    const cashPrice = totalPrice * (1 - cashDiscountPct / 100);
-    const installmentCount = b.pricingConfig?.installmentCount || 4;
-    const installmentValue = totalPrice / installmentCount;
+    const cashDiscountPct = b.pricingConfig?.cashDiscountPct !== undefined ? Number(b.pricingConfig.cashDiscountPct) : 10;
+    const cashPrice = Number((totalPrice * (1 - Math.max(0, Math.min(100, cashDiscountPct)) / 100)).toFixed(2));
+    const installmentCount = Math.max(1, Math.min(60, Math.floor(Number(b.pricingConfig?.installmentCount) || 4)));
+    const installmentValue = Number((totalPrice / installmentCount).toFixed(2));
 
     const now = new Date();
     const issueDate = now.toISOString().slice(0, 10);

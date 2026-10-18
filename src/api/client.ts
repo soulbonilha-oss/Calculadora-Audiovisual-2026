@@ -144,6 +144,17 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     }).then((r) => handleResponse<ProposalSnapshot>(r)),
+  getProposals: () => fetch(`${BASE_URL}/proposals`).then((r) => handleResponse<ProposalSnapshot[]>(r)),
+  getBudgetProposals: (budgetId: string) =>
+    fetch(`${BASE_URL}/budgets/${budgetId}/proposals`).then((r) => handleResponse<ProposalSnapshot[]>(r)),
+  getProposal: (id: string) =>
+    fetch(`${BASE_URL}/proposals/${id}`).then((r) => handleResponse<ProposalSnapshot>(r)),
+
+  // Gestão de Demonstração
+  clearSampleData: () =>
+    fetch(`${BASE_URL}/demo/clear-samples`, { method: 'POST' }).then((r) => handleResponse<{ success: boolean; message: string }>(r)),
+  restoreSampleData: () =>
+    fetch(`${BASE_URL}/demo/restore-samples`, { method: 'POST' }).then((r) => handleResponse<{ success: boolean; message: string }>(r)),
 
   // Backup & Restauração
   exportBackupJsonUrl: () => `${BASE_URL}/backup/export-json`,
