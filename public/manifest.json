@@ -1,0 +1,17 @@
+{
+  "name": "FBonilha Audiovisual - Orçamentos & Precificação",
+  "short_name": "FBonilha",
+  "description": "Sistema profissional de cálculo de custos, formação de preços, rentabilidade e propostas comerciais para produtoras audiovisuais.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#059669",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

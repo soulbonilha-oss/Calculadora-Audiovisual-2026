@@ -1,0 +1,6 @@
+{
+  "name": "FBonilha Audiovisual - Orçamentos & Precificação",
+  "description": "Sistema profissional de cálculo de custos, formação de preços, rentabilidade e propostas comerciais para produtoras audiovisuais.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
