@@ -53,6 +53,10 @@ export function setTestMode(active: boolean | null): void {
   explicitTestMode = active;
 }
 
+export function getTestMode(): boolean | null {
+  return explicitTestMode;
+}
+
 export function isTestEnvironment(): boolean {
   if (explicitTestMode !== null) {
     return explicitTestMode;

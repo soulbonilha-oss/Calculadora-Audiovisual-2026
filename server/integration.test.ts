@@ -18,7 +18,16 @@ import {
   getRawSafetyBackupDir,
   SUPPORTED_SCHEMA_VERSIONS,
 } from './api.js';
-import { setDbInstance, getDbInstance, runMigrations, clearSampleData, restoreSampleData, CANONICAL_SAMPLE_IDS } from './db.js';
+import {
+  setDbInstance,
+  getDbInstance,
+  runMigrations,
+  clearSampleData,
+  restoreSampleData,
+  CANONICAL_SAMPLE_IDS,
+  setTestMode,
+  getTestMode,
+} from './db.js';
 import { generateCommercialProposalPdf } from '../src/utils/pdfGenerator.js';
 import { calculateProjectPricing } from '../src/financial/engine.js';
 
@@ -1268,8 +1277,15 @@ test('RC4.1 - O isolamento continua funcionando quando NODE_ENV não está defin
       assert.deepEqual(filesAfter.sort(), filesBefore.sort(), 'data/backups não deve ser modificado');
     });
   } finally {
-    process.env.NODE_ENV = originalNodeEnv;
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
   }
+
+  // Verifica que após o teste a variável NODE_ENV foi restaurada exatamente ao que era
+  assert.equal(process.env.NODE_ENV, originalNodeEnv);
 });
 
 test('RC4.2 - A limpeza remove os arquivos temporários mesmo quando uma operação/teste falha', async () => {
@@ -1509,5 +1525,197 @@ test('RC4.6 - Modo merge: validação prévia integral rejeita payload malformad
     assert.equal(eq.name, 'Câmera Intacta Val');
   });
 });
+
+// ============================================================================
+// RODADA COMPLEMENTAR 5: VALIDAÇÃO DE RESTAURAÇÃO DE NODE_ENV E CICLO DE VIDA DE withTestServer
+// ============================================================================
+
+test('RC5.1 - Restauração segura de NODE_ENV: quando ausente, continua estritamente ausente (não vira string "undefined")', () => {
+  const saved = process.env.NODE_ENV;
+  delete process.env.NODE_ENV;
+  assert.equal('NODE_ENV' in process.env, false, 'NODE_ENV deve estar ausente antes do teste');
+
+  try {
+    const original = process.env.NODE_ENV;
+    try {
+      // Simula operação sob ambiente temporariamente modificado
+      assert.equal(process.env.NODE_ENV, undefined);
+    } finally {
+      if (original === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = original;
+      }
+    }
+
+    // Deve permanecer estritamente ausente e NUNCA conter a string literal "undefined"
+    assert.equal('NODE_ENV' in process.env, false, 'Chave NODE_ENV não deve existir em process.env');
+    assert.equal(process.env.NODE_ENV, undefined);
+    assert.notEqual(process.env.NODE_ENV, 'undefined');
+  } finally {
+    if (saved === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = saved;
+    }
+  }
+});
+
+test('RC5.2 - Restauração segura de NODE_ENV: quando presente, restaura valor exato mesmo em caso de falha', async () => {
+  const saved = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'staging_custom_env_val';
+
+  try {
+    const original = process.env.NODE_ENV;
+    await assert.rejects(
+      async () => {
+        try {
+          delete process.env.NODE_ENV;
+          assert.equal(process.env.NODE_ENV, undefined);
+          throw new Error('Falha simulada dentro de bloco de teste');
+        } finally {
+          if (original === undefined) {
+            delete process.env.NODE_ENV;
+          } else {
+            process.env.NODE_ENV = original;
+          }
+        }
+      },
+      (err: any) => err.message === 'Falha simulada dentro de bloco de teste'
+    );
+
+    assert.equal(process.env.NODE_ENV, 'staging_custom_env_val', 'Valor original restaurado com precisão');
+  } finally {
+    if (saved === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = saved;
+    }
+  }
+});
+
+test('RC5.3 - withTestServer restaura estado global anterior (db, safetyBackupDir, testMode) após execução normal', async () => {
+  const sentinelDb = new DatabaseSync(':memory:');
+  const sentinelSafetyDir = '/tmp/sentinel_safety_dir_normal';
+  setDbInstance(sentinelDb);
+  setSafetyBackupDir(sentinelSafetyDir);
+  setTestMode(true);
+
+  try {
+    await withTestServer(async ({ db, backupDir }) => {
+      // Durante a execução do teste, o estado aponta para o ambiente efêmero do teste
+      assert.notEqual(getDbInstance(), sentinelDb);
+      assert.equal(getDbInstance(), db);
+      assert.equal(getRawSafetyBackupDir(), backupDir);
+    });
+
+    // Após término normal, o estado global anterior foi restaurado sem fechar o recurso externo
+    assert.equal(getDbInstance(), sentinelDb, 'dbInstance restaurado para a instância prévia');
+    assert.equal(getRawSafetyBackupDir(), sentinelSafetyDir, 'safetyBackupDir restaurado para o caminho prévio');
+    assert.equal(getTestMode(), true, 'testMode restaurado');
+
+    // Comprova que o sentinelDb continua aberto e operacional (não foi fechado por withTestServer)
+    const check = sentinelDb.prepare('SELECT 1 as val').get() as any;
+    assert.equal(check.val, 1, 'Recurso anterior de outro contexto continua aberto e funcional');
+  } finally {
+    sentinelDb.close();
+    setDbInstance(null);
+    setSafetyBackupDir(null);
+    setTestMode(null);
+  }
+});
+
+test('RC5.4 - withTestServer restaura estado global anterior quando a função de teste lança exceção', async () => {
+  const sentinelDb = new DatabaseSync(':memory:');
+  const sentinelSafetyDir = '/tmp/sentinel_safety_dir_fail';
+  setDbInstance(sentinelDb);
+  setSafetyBackupDir(sentinelSafetyDir);
+  setTestMode(false);
+
+  try {
+    await assert.rejects(
+      async () => {
+        await withTestServer(async ({ db }) => {
+          assert.equal(getDbInstance(), db);
+          throw new Error('Falha esperada para teste de resiliência');
+        });
+      },
+      (err: any) => err.message === 'Falha esperada para teste de resiliência'
+    );
+
+    // Estado anterior preservado/restaurado
+    assert.equal(getDbInstance(), sentinelDb, 'dbInstance restaurado após erro do teste');
+    assert.equal(getRawSafetyBackupDir(), sentinelSafetyDir, 'safetyBackupDir restaurado após erro do teste');
+    assert.equal(getTestMode(), false, 'testMode restaurado após erro do teste');
+
+    // Confirma que sentinelDb continua operacional
+    const check = sentinelDb.prepare('SELECT 42 as answer').get() as any;
+    assert.equal(check.answer, 42);
+  } finally {
+    sentinelDb.close();
+    setDbInstance(null);
+    setSafetyBackupDir(null);
+    setTestMode(null);
+  }
+});
+
+test('RC5.5 - Falha durante a preparação do servidor não deixa recursos temporários ou referências globais abandonadas', async () => {
+  const sentinelDb = new DatabaseSync(':memory:');
+  const sentinelSafetyDir = '/tmp/sentinel_prep_fail';
+  setDbInstance(sentinelDb);
+  setSafetyBackupDir(sentinelSafetyDir);
+
+  const originalListen = express.application.listen;
+  // Intercepta app.listen para disparar erro durante a inicialização do Express
+  (express.application as any).listen = function () {
+    throw new Error('Falha simulada na inicialização do servidor HTTP');
+  };
+
+  try {
+    await assert.rejects(
+      async () => {
+        await withTestServer(async () => {});
+      },
+      (err: any) => err.message === 'Falha simulada na inicialização do servidor HTTP'
+    );
+
+    // O estado global DEVE ter sido restaurado para o sentinela prévio
+    assert.equal(getDbInstance(), sentinelDb, 'dbInstance restaurado após falha na preparação');
+    assert.equal(getRawSafetyBackupDir(), sentinelSafetyDir, 'safetyBackupDir restaurado após falha na preparação');
+  } finally {
+    (express.application as any).listen = originalListen;
+    sentinelDb.close();
+    setDbInstance(null);
+    setSafetyBackupDir(null);
+  }
+});
+
+test('RC5.6 - Serialização de withTestServer via mutex impede race conditions e interferência de estado global', async () => {
+  let activeTests = 0;
+  let maxConcurrent = 0;
+
+  // Lança duas execuções simultâneas em Promise.all
+  await Promise.all([
+    withTestServer(async ({ db }) => {
+      activeTests++;
+      maxConcurrent = Math.max(maxConcurrent, activeTests);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(getDbInstance(), db);
+      activeTests--;
+    }),
+    withTestServer(async ({ db }) => {
+      activeTests++;
+      maxConcurrent = Math.max(maxConcurrent, activeTests);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(getDbInstance(), db);
+      activeTests--;
+    }),
+  ]);
+
+  // Graças ao mutex de fila, as execuções foram serializadas e maxConcurrent nunca ultrapassou 1
+  assert.equal(maxConcurrent, 1, 'withTestServer deve serializar execuções para evitar race conditions');
+  assert.equal(activeTests, 0);
+});
+
 
 
