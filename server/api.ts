@@ -1133,6 +1133,38 @@ export const CANONICAL_ARRAY_COLLECTIONS = [
   'proposals',
 ] as const;
 
+export const SUPPORTED_SCHEMA_VERSIONS = [1, 2, 3, 4] as const;
+export const CURRENT_SCHEMA_VERSION = 4;
+
+export function parseAndValidateImportMode(queryVal: any, bodyVal: any): 'preview' | 'commit' {
+  // Conflito ambíguo se fornecido em ambos com valores divergentes
+  if (queryVal !== undefined && bodyVal !== undefined && queryVal !== bodyVal) {
+    throw new Error('Parâmetro "mode" ambíguo: valores divergentes fornecidos na URL e no corpo da requisição.');
+  }
+
+  const raw = queryVal !== undefined ? queryVal : bodyVal;
+
+  // Valor ausente: padrão documentado da aplicação é 'preview'
+  if (raw === undefined || raw === null) {
+    return 'preview';
+  }
+
+  if (typeof raw !== 'string') {
+    throw new Error('Parâmetro "mode" inválido: deve ser uma string ("preview" ou "commit").');
+  }
+
+  const trimmed = raw.trim();
+  if (trimmed === '') {
+    throw new Error('Parâmetro "mode" não pode ser uma string vazia. Forneça "preview" ou "commit".');
+  }
+
+  if (trimmed !== 'preview' && trimmed !== 'commit') {
+    throw new Error(`Modo de importação "${trimmed}" inválido. Valores aceitos: "preview" ou "commit".`);
+  }
+
+  return trimmed as 'preview' | 'commit';
+}
+
 export function parseAndValidateRestoreMode(queryVal: any, bodyVal: any): 'replace' | 'merge' {
   // Conflito ambíguo se fornecido em ambos com valores divergentes
   if (queryVal !== undefined && bodyVal !== undefined && queryVal !== bodyVal) {
@@ -1162,8 +1194,29 @@ export function parseAndValidateRestoreMode(queryVal: any, bodyVal: any): 'repla
   return trimmed as 'replace' | 'merge';
 }
 
+let defaultSafetyBackupDir: string | null = null;
+
+export function setSafetyBackupDir(dir: string | null): void {
+  defaultSafetyBackupDir = dir;
+}
+
+export function getSafetyBackupDir(): string {
+  if (defaultSafetyBackupDir) {
+    return defaultSafetyBackupDir;
+  }
+  if (process.env.SAFETY_BACKUP_DIR) {
+    return process.env.SAFETY_BACKUP_DIR;
+  }
+  if (process.env.NODE_ENV === 'test') {
+    throw new Error(
+      '[TEST GUARD] Tentativa não autorizada de criar backup de segurança no diretório persistente do projeto (data/backups) em ambiente de teste. Os testes devem utilizar um diretório temporário isolado via withTestServer() ou setSafetyBackupDir().'
+    );
+  }
+  return path.resolve(process.cwd(), 'data', 'backups');
+}
+
 export function createSafetyBackup(db: DatabaseSync, targetDir?: string): string {
-  const dir = targetDir || path.resolve(process.cwd(), 'data', 'backups');
+  const dir = targetDir || getSafetyBackupDir();
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -1240,8 +1293,17 @@ export function validateBackupPayload(
   }
 
   if (payload.schema_version !== undefined) {
-    if (typeof payload.schema_version !== 'number' || isNaN(payload.schema_version) || payload.schema_version < 1) {
+    if (
+      typeof payload.schema_version !== 'number' ||
+      isNaN(payload.schema_version) ||
+      !Number.isInteger(payload.schema_version) ||
+      payload.schema_version <= 0
+    ) {
       errors.push('A versão de esquema ("schema_version") deve ser um número inteiro positivo.');
+    } else if (!SUPPORTED_SCHEMA_VERSIONS.includes(payload.schema_version as any)) {
+      errors.push(
+        `Versão de esquema ("schema_version") ${payload.schema_version} não suportada por esta versão da aplicação. Versões suportadas: ${SUPPORTED_SCHEMA_VERSIONS.join(', ')}.`
+      );
     }
   }
   if (payload.version !== undefined) {
@@ -1249,8 +1311,12 @@ export function validateBackupPayload(
       errors.push('A versão da aplicação ("version") deve ser uma string não vazia.');
     }
   }
-  if (payload.schema_version === undefined && !payload.version) {
-    warnings.push('Versão de esquema ausente no arquivo; assumindo formato compatível v1.');
+  if (payload.schema_version === undefined) {
+    warnings.push(
+      payload.version
+        ? `Versão de esquema ("schema_version") ausente no arquivo; assumindo formato compatível com a versão declarada "${payload.version}".`
+        : 'Versão de esquema ausente no arquivo; assumindo formato compatível v1.'
+    );
   }
 
   if (!payload.data || typeof payload.data !== 'object' || Array.isArray(payload.data)) {
@@ -1909,13 +1975,19 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
   try {
     const db = getDb();
     const payload = req.body?.payload ? req.body.payload : req.body;
-    const mode = (req.query.mode as string) || req.body?.mode || 'preview';
+
+    let mode: 'preview' | 'commit';
+    try {
+      mode = parseAndValidateImportMode(req.query.mode, req.body?.mode);
+    } catch (modeErr: any) {
+      return res.status(400).json({ error: modeErr.message });
+    }
 
     let restoreMode: 'replace' | 'merge';
     try {
       restoreMode = parseAndValidateRestoreMode(req.query.restoreMode, req.body?.restoreMode);
-    } catch (modeErr: any) {
-      return res.status(400).json({ error: modeErr.message });
+    } catch (restoreModeErr: any) {
+      return res.status(400).json({ error: restoreModeErr.message });
     }
 
     const validation = validateBackupPayload(payload, db, { restoreMode });

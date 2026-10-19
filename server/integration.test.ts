@@ -5,7 +5,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import express from 'express';
-import { apiRouter, exportBackupData, restoreBackupData, validateBackupPayload, parseNumericField, createSafetyBackup } from './api.js';
+import {
+  apiRouter,
+  exportBackupData,
+  restoreBackupData,
+  validateBackupPayload,
+  parseNumericField,
+  createSafetyBackup,
+  parseAndValidateImportMode,
+  setSafetyBackupDir,
+  getSafetyBackupDir,
+  SUPPORTED_SCHEMA_VERSIONS,
+} from './api.js';
 import { setDbInstance, runMigrations, clearSampleData, restoreSampleData, CANONICAL_SAMPLE_IDS } from './db.js';
 import { generateCommercialProposalPdf } from '../src/utils/pdfGenerator.js';
 import { calculateProjectPricing } from '../src/financial/engine.js';
@@ -909,3 +920,302 @@ test('E4.2 - Validação de restoreMode: rejeita desconhecido, string vazia, tip
     assert.ok(item, 'Nenhum dado é alterado quando a validação de restoreMode falha');
   });
 });
+
+// ============================================================================
+// RODADA COMPLEMENTAR 1: VALIDAÇÃO DO PARÂMETRO mode NA RESTAURAÇÃO
+// ============================================================================
+
+test('RC1.1 - POST /backup/import-json aceita exclusivamente mode=preview e mode=commit', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    const payload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Test Preview' },
+        equipment: [{ id: 'eq_preview_test', name: 'Microfone Teste', purchase_value: 1000 }],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    // 1. mode=preview aceito (retorna validação estrutural sem alterar o banco)
+    const resPreview = await fetch(`${baseUrl}/backup/import-json?mode=preview&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(resPreview.status, 200);
+    const bodyPreview = (await resPreview.json()) as any;
+    assert.equal(bodyPreview.valid, true);
+
+    // Banco NÃO deve ter inserido eq_preview_test no modo preview
+    assert.equal(db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_preview_test'), undefined);
+
+    // 2. mode=commit aceito (aplica a restauração com sucesso)
+    const resCommit = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(resCommit.status, 200);
+    const bodyCommit = (await resCommit.json()) as any;
+    assert.equal(bodyCommit.success, true);
+
+    // Banco deve conter eq_preview_test após o commit
+    const inserted = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_preview_test') as any;
+    assert.ok(inserted);
+    assert.equal(inserted.name, 'Microfone Teste');
+
+    // 3. Ausente adota padrão preview
+    const resDefault = await fetch(`${baseUrl}/backup/import-json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(resDefault.status, 200);
+    const bodyDefault = (await resDefault.json()) as any;
+    assert.equal(bodyDefault.valid, true);
+    assert.ok(bodyDefault.summary !== undefined);
+  });
+});
+
+test('RC1.2 - POST /backup/import-json rejeita mode inválido (preveiw, unknown, string vazia, tipo incorreto) e nenhum dado é alterado', async () => {
+  await withTestServer(async ({ baseUrl, db, backupDir }) => {
+    // 1. Cadastra item pré-existente
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)').run('eq_protegido_mode', 'Câmera Intacta Mode', 15000, 1500);
+
+    const payload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Tentativa Invalida' },
+        equipment: [{ id: 'eq_novo_invasor', name: 'Item Invasor', purchase_value: 9999 }],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    // Caso A: Erro de digitação comum mode=preveiw (NUNCA deve ser interpretado como commit)
+    const resTypo = await fetch(`${baseUrl}/backup/import-json?mode=preveiw&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(resTypo.status, 400);
+    const bodyTypo = (await resTypo.json()) as any;
+    assert.match(bodyTypo.error, /Modo de importação "preveiw" inválido/);
+
+    // Caso B: mode=unknown
+    const resUnknown = await fetch(`${baseUrl}/backup/import-json?mode=unknown&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(resUnknown.status, 400);
+    const bodyUnknown = (await resUnknown.json()) as any;
+    assert.match(bodyUnknown.error, /Modo de importação "unknown" inválido/);
+
+    // Caso C: String vazia mode=
+    const resEmpty = await fetch(`${baseUrl}/backup/import-json?mode=&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(resEmpty.status, 400);
+    const bodyEmpty = (await resEmpty.json()) as any;
+    assert.match(bodyEmpty.error, /não pode ser uma string vazia/);
+
+    // Caso D: Tipo incorreto (número no corpo da requisição)
+    const resType = await fetch(`${baseUrl}/backup/import-json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload, mode: 12345 }),
+    });
+    assert.equal(resType.status, 400);
+    const bodyType = (await resType.json()) as any;
+    assert.match(bodyType.error, /deve ser uma string/);
+
+    // Caso E: Conflito ambíguo (query string preview, corpo commit)
+    const resAmbiguous = await fetch(`${baseUrl}/backup/import-json?mode=preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload, mode: 'commit' }),
+    });
+    assert.equal(resAmbiguous.status, 400);
+    const bodyAmbiguous = (await resAmbiguous.json()) as any;
+    assert.match(bodyAmbiguous.error, /ambíguo/);
+
+    // 2. Consulta de integridade no banco: NENHUM dado mudou
+    const original = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_protegido_mode') as any;
+    assert.ok(original, 'Item original deve permanecer intacto');
+    assert.equal(original.name, 'Câmera Intacta Mode');
+
+    const invader = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_novo_invasor');
+    assert.equal(invader, undefined, 'Item invasor jamais pode ser gravado se o mode for inválido');
+
+    // 3. Comprova que NENHUM arquivo de backup de segurança foi criado no diretório de teste
+    const safetyFiles = fs.readdirSync(backupDir).filter((f) => f.startsWith('safety_pre_restore_'));
+    assert.equal(safetyFiles.length, 0, 'Nenhum backup de segurança deve ser criado se mode for rejeitado');
+  });
+});
+
+// ============================================================================
+// RODADA COMPLEMENTAR 2: ISOLAMENTO DOS ARQUIVOS DE BACKUP DE TESTE
+// ============================================================================
+
+test('RC2.1 - Testes HTTP e de restauração NÃO criam arquivos no diretório persistente data/backups', async () => {
+  const permanentBackupDir = path.resolve(process.cwd(), 'data', 'backups');
+  const filesBefore = fs.existsSync(permanentBackupDir) ? fs.readdirSync(permanentBackupDir) : [];
+
+  await withTestServer(async ({ baseUrl, db, backupDir }) => {
+    const payload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Test Isolation' },
+        equipment: [{ id: 'eq_iso_1', name: 'Monitor Referência', purchase_value: 7000 }],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    // Executa restauração destrutiva real via HTTP (que aciona createSafetyBackup)
+    const res = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(res.status, 200);
+
+    // O backup de segurança DEVE ter sido gravado exclusivamente no backupDir temporário do teste
+    const testSafetyFiles = fs.readdirSync(backupDir).filter((f) => f.startsWith('safety_pre_restore_'));
+    assert.ok(testSafetyFiles.length >= 1, 'Backup de segurança deve existir no diretório temporário isolado do teste');
+
+    // O diretório persistente data/backups NUNCA deve receber novos arquivos
+    const filesAfterInTest = fs.existsSync(permanentBackupDir) ? fs.readdirSync(permanentBackupDir) : [];
+    assert.deepEqual(
+      filesAfterInTest.sort(),
+      filesBefore.sort(),
+      'O diretório permanente data/backups não pode ter nenhum arquivo adicionado durante testes'
+    );
+  });
+
+  // Após withTestServer encerrar, o diretório permanente continua idêntico
+  const filesAfter = fs.existsSync(permanentBackupDir) ? fs.readdirSync(permanentBackupDir) : [];
+  assert.deepEqual(filesAfter.sort(), filesBefore.sort(), 'Nenhum arquivo persistido em data/backups');
+});
+
+test('RC2.2 - Test Guard: Tentativa de invocar createSafetyBackup sem diretório isolado em teste é bloqueada', () => {
+  setSafetyBackupDir(null);
+
+  assert.throws(
+    () => {
+      getSafetyBackupDir();
+    },
+    (err: any) => {
+      assert.match(err.message, /\[TEST GUARD\] Tentativa não autorizada de criar backup de segurança no diretório persistente do projeto/);
+      return true;
+    },
+    'Deve bloquear tentativa de usar data/backups em ambiente de teste sem isolamento explícito'
+  );
+});
+
+// ============================================================================
+// RODADA COMPLEMENTAR 3: CORREÇÃO E VALIDAÇÃO ESTRITA DE schema_version
+// ============================================================================
+
+test('RC3.1 - schema_version: versões válidas (1, 2, 3, 4) e legado compatível são aceitas', () => {
+  const baseData = {
+    settings: { studio_name: 'Studio Test' },
+    equipment: [],
+    recurring_expenses: [],
+    expense_catalog: [],
+    professionals: [],
+    production_templates: [],
+    budgets: [],
+    proposals: [],
+  };
+
+  // Versões de 1 a 4 são explicitamente suportadas
+  for (const v of SUPPORTED_SCHEMA_VERSIONS) {
+    const report = validateBackupPayload({
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: v,
+      data: baseData,
+    });
+    assert.equal(report.isValid, true, `schema_version ${v} deve ser aceita`);
+  }
+
+  // Backup legado sem schema_version, mas com version informada
+  const legacyReport = validateBackupPayload({
+    app: 'FBonilha.mov',
+    version: '1.0.0',
+    data: baseData,
+  });
+  assert.equal(legacyReport.isValid, true, 'Backup legado v1 sem schema_version deve ser aceito');
+  assert.ok(legacyReport.warnings.length > 0);
+});
+
+test('RC3.2 - schema_version: rejeita números fracionários, NaN, strings, zero, negativos e versões futuras não suportadas', () => {
+  const baseData = {
+    settings: { studio_name: 'Studio Test' },
+    equipment: [],
+    recurring_expenses: [],
+    expense_catalog: [],
+    professionals: [],
+    production_templates: [],
+    budgets: [],
+    proposals: [],
+  };
+
+  // 1. Número fracionário (ex: 2.5, 3.14)
+  const repFrac = validateBackupPayload({ app: 'FBonilha.mov', version: '2.0.0', schema_version: 2.5, data: baseData });
+  assert.equal(repFrac.isValid, false);
+  assert.match(repFrac.errors[0], /inteiro positivo/i);
+
+  // 2. NaN
+  const repNan = validateBackupPayload({ app: 'FBonilha.mov', version: '2.0.0', schema_version: NaN, data: baseData });
+  assert.equal(repNan.isValid, false);
+  assert.match(repNan.errors[0], /inteiro positivo/i);
+
+  // 3. String
+  const repStr = validateBackupPayload({ app: 'FBonilha.mov', version: '2.0.0', schema_version: '4' as any, data: baseData });
+  assert.equal(repStr.isValid, false);
+  assert.match(repStr.errors[0], /inteiro positivo/i);
+
+  // 4. Zero (0)
+  const repZero = validateBackupPayload({ app: 'FBonilha.mov', version: '2.0.0', schema_version: 0, data: baseData });
+  assert.equal(repZero.isValid, false);
+  assert.match(repZero.errors[0], /inteiro positivo/i);
+
+  // 5. Número negativo (-1)
+  const repNeg = validateBackupPayload({ app: 'FBonilha.mov', version: '2.0.0', schema_version: -1, data: baseData });
+  assert.equal(repNeg.isValid, false);
+  assert.match(repNeg.errors[0], /inteiro positivo/i);
+
+  // 6. Versão futura não suportada (ex: 5, 99)
+  const repFuture = validateBackupPayload({ app: 'FBonilha.mov', version: '2.0.0', schema_version: 5, data: baseData });
+  assert.equal(repFuture.isValid, false);
+  assert.match(repFuture.errors[0], /não suportada por esta versão da aplicação/i);
+
+  const repFuture99 = validateBackupPayload({ app: 'FBonilha.mov', version: '2.0.0', schema_version: 99, data: baseData });
+  assert.equal(repFuture99.isValid, false);
+  assert.match(repFuture99.errors[0], /não suportada por esta versão da aplicação/i);
+});
+
