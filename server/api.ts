@@ -1234,32 +1234,61 @@ export function createSafetyBackup(db: DatabaseSync, targetDir?: string): string
     throw new Error('Arquivo de backup de segurança com o mesmo nome já existe.');
   }
 
-  // Executar VACUUM INTO atômico do SQLite
-  db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}';`);
+  let createdByThisAttempt = false;
 
-  if (!fs.existsSync(backupPath)) {
-    throw new Error('Arquivo de backup de segurança não foi criado no disco.');
-  }
-
-  const stat = fs.statSync(backupPath);
-  if (stat.size === 0) {
-    try { fs.unlinkSync(backupPath); } catch {}
-    throw new Error('Arquivo de backup de segurança gerado com tamanho zero.');
-  }
-
-  // PRAGMA integrity_check no snapshot criado
-  const testDb = new DatabaseSync(backupPath);
   try {
-    const check = testDb.prepare('PRAGMA integrity_check').get() as any;
-    if (check?.integrity_check !== 'ok') {
-      try { fs.unlinkSync(backupPath); } catch {}
-      throw new Error('Verificação de integridade do backup de segurança falhou.');
+    // Executar VACUUM INTO atômico do SQLite
+    try {
+      db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}';`);
+      if (fs.existsSync(backupPath)) {
+        createdByThisAttempt = true;
+      }
+    } catch (vacuumErr) {
+      if (fs.existsSync(backupPath)) {
+        createdByThisAttempt = true;
+      }
+      throw vacuumErr;
     }
-  } finally {
-    testDb.close();
-  }
 
-  return backupPath;
+    if (!fs.existsSync(backupPath)) {
+      throw new Error('Arquivo de backup de segurança não foi criado no disco.');
+    }
+
+    const stat = fs.statSync(backupPath);
+    if (stat.size === 0) {
+      throw new Error('Arquivo de backup de segurança gerado com tamanho zero.');
+    }
+
+    // PRAGMA integrity_check no snapshot criado
+    let testDb: DatabaseSync | null = null;
+    try {
+      testDb = new DatabaseSync(backupPath);
+      const check = testDb.prepare('PRAGMA integrity_check').get() as any;
+      if (check?.integrity_check !== 'ok') {
+        throw new Error(`Verificação de integridade do backup de segurança falhou: ${check?.integrity_check || 'inconsistência estrutural'}`);
+      }
+    } finally {
+      if (testDb) {
+        try {
+          testDb.close();
+        } catch (closeErr) {
+          console.error('[CLEANUP] Falha ao fechar conexão de validação de backup:', closeErr);
+        }
+      }
+    }
+
+    return backupPath;
+  } catch (error) {
+    // Se a criação, abertura ou validação de integridade falhar, remover o arquivo incompleto desta tentativa
+    if (createdByThisAttempt && fs.existsSync(backupPath)) {
+      try {
+        fs.unlinkSync(backupPath);
+      } catch (unlinkErr) {
+        console.error('[CLEANUP] Falha ao remover arquivo de backup incompleto:', unlinkErr);
+      }
+    }
+    throw error;
+  }
 }
 
 export function validateBackupPayload(

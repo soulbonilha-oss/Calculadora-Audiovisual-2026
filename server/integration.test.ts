@@ -1284,8 +1284,12 @@ test('RC4.1 - O isolamento continua funcionando quando NODE_ENV não está defin
     }
   }
 
-  // Verifica que após o teste a variável NODE_ENV foi restaurada exatamente ao que era
-  assert.equal(process.env.NODE_ENV, originalNodeEnv);
+  // Verifica explicitamente que o estado e a presença da variável foram restaurados fielmente
+  if (originalNodeEnv === undefined) {
+    assert.equal('NODE_ENV' in process.env, false, 'Chave NODE_ENV não deve existir em process.env se estava ausente');
+  } else {
+    assert.equal(process.env.NODE_ENV, originalNodeEnv, 'Valor de NODE_ENV deve corresponder exatamente ao original');
+  }
 });
 
 test('RC4.2 - A limpeza remove os arquivos temporários mesmo quando uma operação/teste falha', async () => {
@@ -1715,6 +1719,127 @@ test('RC5.6 - Serialização de withTestServer via mutex impede race conditions 
   // Graças ao mutex de fila, as execuções foram serializadas e maxConcurrent nunca ultrapassou 1
   assert.equal(maxConcurrent, 1, 'withTestServer deve serializar execuções para evitar race conditions');
   assert.equal(activeTests, 0);
+});
+
+test('RC5.7 - Falha durante a execução de migrações na preparação de withTestServer restaura estado global e não deixa arquivos temporários', async () => {
+  const sentinelDb = new DatabaseSync(':memory:');
+  const sentinelSafetyDir = '/tmp/sentinel_migration_fail';
+  setDbInstance(sentinelDb);
+  setSafetyBackupDir(sentinelSafetyDir);
+
+  const origExec = DatabaseSync.prototype.exec;
+  // Intercepta exec para simular falha catastrófica durante as migrações iniciais do banco
+  DatabaseSync.prototype.exec = function (sql: string) {
+    if (typeof sql === 'string' && sql.includes('CREATE TABLE IF NOT EXISTS settings')) {
+      throw new Error('Falha simulada na execução das migrações do SQLite');
+    }
+    return origExec.apply(this, arguments as any);
+  };
+
+  try {
+    await assert.rejects(
+      async () => {
+        await withTestServer(async () => {});
+      },
+      (err: any) => err.message === 'Falha simulada na execução das migrações do SQLite'
+    );
+
+    // O estado global DEVE ter sido restaurado para o sentinela prévio
+    assert.equal(getDbInstance(), sentinelDb, 'dbInstance restaurado após falha nas migrações');
+    assert.equal(getRawSafetyBackupDir(), sentinelSafetyDir, 'safetyBackupDir restaurado após falha nas migrações');
+  } finally {
+    DatabaseSync.prototype.exec = origExec;
+    sentinelDb.close();
+    setDbInstance(null);
+    setSafetyBackupDir(null);
+  }
+});
+
+test('RC5.8 - createSafetyBackup: falha na verificação de integridade remove arquivo incompleto gerado e não modifica o banco', async () => {
+  await withTestServer(async ({ baseUrl, db, backupDir }) => {
+    // 1. Estado inicial do banco protegido
+    db.prepare('UPDATE settings SET studio_name = ? WHERE id = 1').run('Studio Original Seguro');
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)')
+      .run('eq_intacto_58', 'Câmera Intacta 58', 10000, 1000);
+
+    // Cria um arquivo preexistente legítimo no diretório para comprovar que NÃO é removido
+    const preexistingFile = path.resolve(backupDir, 'preexisting_valid_file.txt');
+    fs.writeFileSync(preexistingFile, 'arquivo legitimo preexistente');
+
+    // Intercepta DatabaseSync.prototype.prepare especificamente para o integrity_check do snapshot
+    const origPrepare = DatabaseSync.prototype.prepare;
+    DatabaseSync.prototype.prepare = function (sql: string) {
+      if (typeof sql === 'string' && sql.includes('PRAGMA integrity_check')) {
+        return {
+          get: () => ({ integrity_check: 'corrupt page 1 found' }),
+        } as any;
+      }
+      return origPrepare.apply(this, arguments as any);
+    };
+
+    try {
+      // 2. Invocar createSafetyBackup diretamente deve lançar erro e apagar o snapshot gerado
+      assert.throws(
+        () => {
+          createSafetyBackup(db, backupDir);
+        },
+        (err: any) => {
+          assert.match(err.message, /Verificação de integridade do backup de segurança falhou: corrupt page 1 found/);
+          return true;
+        }
+      );
+
+      // 3. Comprova que o arquivo de backup incompleto/corrompido gerado nesta tentativa foi removido
+      const safetyFiles = fs.readdirSync(backupDir).filter((f) => f.startsWith('safety_pre_restore_'));
+      assert.equal(safetyFiles.length, 0, 'Arquivo de backup incompleto deve ter sido removido');
+
+      // 4. Comprova que arquivos anteriores/legítimos no diretório NÃO foram tocados
+      assert.ok(fs.existsSync(preexistingFile), 'Arquivo preexistente legítimo não pode ser removido');
+
+      // 5. Testar também através de restoreBackupData para comprovar que nenhuma alteração no banco ocorre
+      const payload = {
+        app: 'FBonilha.mov',
+        version: '2.0.0',
+        schema_version: 4,
+        data: {
+          settings: { studio_name: 'Studio Tentativa Falha' },
+          equipment: [{ id: 'eq_invasor_58', name: 'Invasor', purchase_value: 9999 }],
+          recurring_expenses: [],
+          expense_catalog: [],
+          professionals: [],
+          production_templates: [],
+          budgets: [],
+          proposals: [],
+        },
+      };
+
+      assert.throws(
+        () => {
+          restoreBackupData(payload, { restoreMode: 'replace', safetyBackupDir: backupDir }, db);
+        },
+        (err: any) => {
+          assert.match(err.message, /Falha de segurança preventiva/);
+          return true;
+        }
+      );
+
+      // 6. Confirmação no banco: nenhum dado foi alterado
+      const currentStudio = (db.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any).studio_name;
+      assert.equal(currentStudio, 'Studio Original Seguro', 'Configuração não foi alterada');
+
+      const originalEq = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_intacto_58') as any;
+      assert.ok(originalEq, 'Registro original intacto');
+
+      const invader = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_invasor_58');
+      assert.equal(invader, undefined, 'Registro invasor não foi inserido');
+
+      // Novamente verifica que nenhum arquivo de backup incompleto permaneceu
+      const safetyFilesAfter = fs.readdirSync(backupDir).filter((f) => f.startsWith('safety_pre_restore_'));
+      assert.equal(safetyFilesAfter.length, 0, 'Nenhum backup corrompido deixado no disco');
+    } finally {
+      DatabaseSync.prototype.prepare = origPrepare;
+    }
+  });
 });
 
 

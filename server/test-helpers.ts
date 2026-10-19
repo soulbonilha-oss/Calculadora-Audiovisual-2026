@@ -87,11 +87,25 @@ async function runIsolatedTestServer(
     app.use('/api', apiRouter);
 
     server = await new Promise<any>((resolve, reject) => {
+      let settled = false;
       try {
-        const s = app.listen(0, () => resolve(s));
-        s.on('error', reject);
+        const s = app.listen(0, () => {
+          if (!settled) {
+            settled = true;
+            resolve(s);
+          }
+        });
+        s.once('error', (err: any) => {
+          if (!settled) {
+            settled = true;
+            reject(err);
+          }
+        });
       } catch (listenErr) {
-        reject(listenErr);
+        if (!settled) {
+          settled = true;
+          reject(listenErr);
+        }
       }
     });
 
