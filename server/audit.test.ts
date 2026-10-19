@@ -4,9 +4,10 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
-import { apiRouter, validateBackupPayload } from './api.js';
+import { apiRouter, validateBackupPayload, restoreBackupData } from './api.js';
 import { generateCommercialProposalPdf } from '../src/utils/pdfGenerator.js';
 import { runMigrations, clearSampleData, listSampleData, restoreSampleData, getDb, setDbInstance } from './db.js';
+import { withTestServer } from './test-helpers.js';
 
 // ============================================================================
 // SUÍTE DE AUDITORIA 1: PERSISTÊNCIA, MIGRAÇÕES E SNAPSHOTS IMUTÁVEIS (SEÇÃO 8)
@@ -493,36 +494,29 @@ test('Auditoria P2.1 - Preservação de ZERO: 0% desconto à vista e parcela ún
 });
 
 // ============================================================================
-// SUÍTE DE AUDITORIA 8: INTEGRAÇÃO HTTP DAS ROTAS REAIS (PRIORIDADE 5)
+// SUÍTE DE AUDITORIA 8: INTEGRAÇÃO HTTP DAS ROTAS REAIS COM ISOLAMENTO TOTAL (ETAPA 2)
 // ============================================================================
-test('Auditoria P5.1 - HTTP API: GET /demo/samples lista os registros canônicos oficiais', async () => {
-  const app = express();
-  app.use('/api', apiRouter);
-  const server = app.listen(0);
-  const port = (server.address() as any).port;
-
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/api/demo/samples`);
+test('Auditoria P5.1 - HTTP API: GET /demo/samples lista os registros canônicos oficiais em banco temporário', async () => {
+  await withTestServer(async ({ baseUrl }) => {
+    const res = await fetch(`${baseUrl}/demo/samples`);
     assert.equal(res.status, 200);
     const data = (await res.json()) as any;
     assert.ok(data.count >= 20, 'Deve conter os itens canônicos oficiais da FBonilha');
     assert.ok(Array.isArray(data.samples));
     const fx3 = data.samples.find((s: any) => s.id === 'eq_camera_fx3');
     assert.ok(fx3, 'FX3 deve estar listada nos demonstrativos');
-  } finally {
-    server.close();
-  }
+  });
 });
 
-test('Auditoria P5.2 - HTTP API: Preservação de valores ZERO em PUT /settings e cálculos', async () => {
-  const app = express();
-  app.use('/api', apiRouter);
-  const server = app.listen(0);
-  const port = (server.address() as any).port;
+test('Auditoria P5.2 - HTTP API: Preservação de valores ZERO em PUT /settings sem poluição do banco persistente', async () => {
+  await withTestServer(async ({ baseUrl }) => {
+    // 1. Obter estado inicial das configurações do banco isolado temporário
+    const initialRes = await fetch(`${baseUrl}/settings`);
+    assert.equal(initialRes.status, 200);
+    const initialSettings = (await initialRes.json()) as any;
 
-  try {
-    // 1. Atualizar settings com valores 0
-    const updateRes = await fetch(`http://127.0.0.1:${port}/api/settings`, {
+    // 2. Atualizar settings com valores 0
+    const updateRes = await fetch(`${baseUrl}/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -539,35 +533,28 @@ test('Auditoria P5.2 - HTTP API: Preservação de valores ZERO em PUT /settings 
     assert.equal(updated.default_tax_pct, 0, '0% imposto deve ser preservado');
     assert.equal(updated.default_financial_fee_pct, 0, '0% taxa financeira deve ser preservada');
 
-    // 2. Restaurar para o padrão FBonilha para não poluir testes posteriores
-    await fetch(`http://127.0.0.1:${port}/api/settings`, {
+    // 3. Restaurar o estado inicial preservado original (sem valores fixos arbitrários)
+    const restoreRes = await fetch(`${baseUrl}/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        default_cash_discount_pct: 10,
-        default_installments: 4,
-        default_tax_pct: 6,
-        default_financial_fee_pct: 2.5,
-      }),
+      body: JSON.stringify(initialSettings),
     });
-  } finally {
-    server.close();
-  }
+    assert.equal(restoreRes.status, 200);
+    const restored = (await restoreRes.json()) as any;
+    assert.equal(restored.default_cash_discount_pct, initialSettings.default_cash_discount_pct);
+    assert.equal(restored.default_installments, initialSettings.default_installments);
+  });
 });
 
-test('Auditoria P5.3 - HTTP API: Importação e Validação de Backup via POST /backup/import-json', async () => {
-  const app = express();
-  app.use('/api', apiRouter);
-  const server = app.listen(0);
-  const port = (server.address() as any).port;
-
-  try {
+test('Auditoria P5.3 - HTTP API: Importação e Validação de Backup via POST /backup/import-json em banco temporário', async () => {
+  await withTestServer(async ({ baseUrl }) => {
     const payload = {
       app: 'FBonilha.mov',
       version: '2.0.0',
       schema_version: 3,
       exported_at: '2026-10-18T14:00:00.000Z',
       data: {
+        settings: { id: 1, studio_name: 'FBonilha Test' },
         equipment: [],
         recurring_expenses: [],
         expense_catalog: [],
@@ -578,7 +565,7 @@ test('Auditoria P5.3 - HTTP API: Importação e Validação de Backup via POST /
       },
     };
 
-    const res = await fetch(`http://127.0.0.1:${port}/api/backup/import-json?mode=preview&restoreMode=replace`, {
+    const res = await fetch(`${baseUrl}/backup/import-json?mode=preview&restoreMode=replace`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -588,9 +575,69 @@ test('Auditoria P5.3 - HTTP API: Importação e Validação de Backup via POST /
     const body = (await res.json()) as any;
     assert.equal(body.valid, true);
     assert.equal(body.errors.length, 0);
-  } finally {
-    server.close();
-  }
+  });
+});
+
+// ============================================================================
+// SUÍTE DE AUDITORIA 9: VERIFICAÇÃO DE ISOLAMENTO E TEST GUARDS (ETAPA 2)
+// ============================================================================
+test('Auditoria E2.1 - Test Guard: Tentativa de acessar DB persistente real em ambiente de teste é imediatamente bloqueada', () => {
+  // Garante que dbInstance está nulo
+  setDbInstance(null);
+
+  // Ao chamar getDb() em NODE_ENV === 'test' sem uma instância isolada, deve lançar exceção de bloqueio
+  assert.throws(
+    () => {
+      getDb();
+    },
+    (err: any) => {
+      assert.match(err.message, /\[TEST GUARD\] Tentativa não autorizada de acessar o banco de dados persistente real/);
+      return true;
+    },
+    'Deve disparar erro de segurança impedindo acesso ao banco persistente de produção'
+  );
+});
+
+test('Auditoria E2.2 - Test Guard: restoreBackupData bloqueia execução contra banco persistente real em teste', () => {
+  const fakePersistentDb = {
+    __isPersistentProductionDb: true,
+    prepare: () => ({ get: () => null, all: () => [] }),
+    exec: () => {},
+  } as any;
+
+  assert.throws(
+    () => {
+      restoreBackupData(
+        { app: 'FBonilha.mov', version: '2.0.0', data: { settings: {}, equipment: [], recurring_expenses: [], expense_catalog: [], professionals: [], production_templates: [], budgets: [], proposals: [] } },
+        { restoreMode: 'replace', skipSafetyBackup: true },
+        fakePersistentDb
+      );
+    },
+    (err: any) => {
+      assert.match(err.message, /\[TEST GUARD\] Operação destrutiva bloqueada/);
+      return true;
+    }
+  );
+});
+
+test('Auditoria E2.3 - Isolamento e Limpeza: withTestServer limpa arquivos temporários mesmo quando teste falha', async () => {
+  let capturedDbPath = '';
+
+  await assert.rejects(
+    async () => {
+      await withTestServer(async ({ dbPath }) => {
+        capturedDbPath = dbPath;
+        assert.ok(fs.existsSync(capturedDbPath), 'Banco temporário deve existir durante execução');
+        throw new Error('Falha intencional no teste para checar limpeza');
+      });
+    },
+    /Falha intencional no teste para checar limpeza/
+  );
+
+  assert.ok(capturedDbPath !== '', 'Caminho temporário deve ter sido registrado');
+  assert.equal(fs.existsSync(capturedDbPath), false, 'Arquivo temporário de banco deve ter sido removido no finally');
+  assert.equal(fs.existsSync(`${capturedDbPath}-wal`), false, 'Arquivo WAL temporário deve ter sido removido');
+  assert.equal(fs.existsSync(`${capturedDbPath}-shm`), false, 'Arquivo SHM temporário deve ter sido removido');
 });
 
 

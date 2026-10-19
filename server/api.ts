@@ -1123,9 +1123,96 @@ export interface BackupValidationReport {
   };
 }
 
-export function validateBackupPayload(payload: any, currentDb?: any): BackupValidationReport {
+export const CANONICAL_ARRAY_COLLECTIONS = [
+  'equipment',
+  'recurring_expenses',
+  'expense_catalog',
+  'professionals',
+  'production_templates',
+  'budgets',
+  'proposals',
+] as const;
+
+export function parseAndValidateRestoreMode(queryVal: any, bodyVal: any): 'replace' | 'merge' {
+  // Conflito ambíguo se fornecido em ambos com valores divergentes
+  if (queryVal !== undefined && bodyVal !== undefined && queryVal !== bodyVal) {
+    throw new Error('Parâmetro "restoreMode" ambíguo: valores divergentes fornecidos na URL e no corpo da requisição.');
+  }
+
+  const raw = queryVal !== undefined ? queryVal : bodyVal;
+
+  // Valor ausente: padrão documentado da aplicação é 'replace'
+  if (raw === undefined || raw === null) {
+    return 'replace';
+  }
+
+  if (typeof raw !== 'string') {
+    throw new Error('Parâmetro "restoreMode" inválido: deve ser uma string ("replace" ou "merge").');
+  }
+
+  const trimmed = raw.trim();
+  if (trimmed === '') {
+    throw new Error('Parâmetro "restoreMode" não pode ser uma string vazia. Forneça "replace" ou "merge".');
+  }
+
+  if (trimmed !== 'replace' && trimmed !== 'merge') {
+    throw new Error(`Modo de restauração "${trimmed}" inválido. Valores aceitos: "replace" ou "merge".`);
+  }
+
+  return trimmed as 'replace' | 'merge';
+}
+
+export function createSafetyBackup(db: DatabaseSync, targetDir?: string): string {
+  const dir = targetDir || path.resolve(process.cwd(), 'data', 'backups');
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const uniqueId = crypto.randomUUID().slice(0, 8);
+  const backupFilename = `safety_pre_restore_${timestamp}_${uniqueId}.sqlite`;
+  const backupPath = path.resolve(dir, backupFilename);
+
+  if (fs.existsSync(backupPath)) {
+    throw new Error('Arquivo de backup de segurança com o mesmo nome já existe.');
+  }
+
+  // Executar VACUUM INTO atômico do SQLite
+  db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}';`);
+
+  if (!fs.existsSync(backupPath)) {
+    throw new Error('Arquivo de backup de segurança não foi criado no disco.');
+  }
+
+  const stat = fs.statSync(backupPath);
+  if (stat.size === 0) {
+    try { fs.unlinkSync(backupPath); } catch {}
+    throw new Error('Arquivo de backup de segurança gerado com tamanho zero.');
+  }
+
+  // PRAGMA integrity_check no snapshot criado
+  const testDb = new DatabaseSync(backupPath);
+  try {
+    const check = testDb.prepare('PRAGMA integrity_check').get() as any;
+    if (check?.integrity_check !== 'ok') {
+      try { fs.unlinkSync(backupPath); } catch {}
+      throw new Error('Verificação de integridade do backup de segurança falhou.');
+    }
+  } finally {
+    testDb.close();
+  }
+
+  return backupPath;
+}
+
+export function validateBackupPayload(
+  payload: any,
+  currentDb?: any,
+  options?: { restoreMode?: 'replace' | 'merge' }
+): BackupValidationReport {
   const errors: string[] = [];
   const warnings: string[] = [];
+  const restoreMode = options?.restoreMode;
   const summary = {
     equipmentCount: 0,
     recurringExpensesCount: 0,
@@ -1145,16 +1232,31 @@ export function validateBackupPayload(payload: any, currentDb?: any): BackupVali
     };
   }
 
-  // Verificar versão do esquema
-  const schemaVersion = payload.schema_version ?? (payload.version ? 1 : null);
-  if (schemaVersion === null) {
+  // 1. Validação de Metadados
+  if (payload.app !== undefined && typeof payload.app !== 'string') {
+    errors.push('O metadado "app" deve ser uma string com o nome da aplicação.');
+  } else if (!payload.app) {
+    warnings.push('Metadado "app" ausente no arquivo; assumindo formato compatível FBonilha.');
+  }
+
+  if (payload.schema_version !== undefined) {
+    if (typeof payload.schema_version !== 'number' || isNaN(payload.schema_version) || payload.schema_version < 1) {
+      errors.push('A versão de esquema ("schema_version") deve ser um número inteiro positivo.');
+    }
+  }
+  if (payload.version !== undefined) {
+    if (typeof payload.version !== 'string' || payload.version.trim() === '') {
+      errors.push('A versão da aplicação ("version") deve ser uma string não vazia.');
+    }
+  }
+  if (payload.schema_version === undefined && !payload.version) {
     warnings.push('Versão de esquema ausente no arquivo; assumindo formato compatível v1.');
   }
 
   if (!payload.data || typeof payload.data !== 'object' || Array.isArray(payload.data)) {
     return {
       isValid: false,
-      errors: ['O arquivo de backup não contém a propriedade "data" estruturada.'],
+      errors: ['O arquivo de backup não contém a propriedade "data" estruturada como um objeto.'],
       warnings,
       summary,
     };
@@ -1162,187 +1264,220 @@ export function validateBackupPayload(payload: any, currentDb?: any): BackupVali
 
   const data = payload.data;
 
-  // Validação de Equipamentos
-  if (data.equipment !== undefined) {
-    if (!Array.isArray(data.equipment)) {
-      errors.push('A entidade "equipment" deve ser uma lista (array).');
-    } else {
-      summary.equipmentCount = data.equipment.length;
-      const seenIds = new Set<string>();
-      data.equipment.forEach((item: any, idx: number) => {
-        if (!item || typeof item !== 'object') {
-          errors.push(`Equipamento na posição ${idx} não é um objeto válido.`);
-          return;
-        }
-        if (!item.id || typeof item.id !== 'string') {
-          errors.push(`Equipamento na posição ${idx} possui identificador (id) inválido.`);
-        } else if (seenIds.has(item.id)) {
-          errors.push(`ID duplicado em equipamentos: "${item.id}".`);
-        } else {
-          seenIds.add(item.id);
-        }
-        if (!item.name || typeof item.name !== 'string') {
-          errors.push(`Equipamento "${item.id || idx}" possui nome obrigatório ausente.`);
-        }
-        if (item.purchase_value !== undefined && (isNaN(Number(item.purchase_value)) || Number(item.purchase_value) < 0)) {
-          errors.push(`Equipamento "${item.name || idx}" possui valor de compra numérico inválido.`);
-        }
-      });
+  // 2. Validação de Presença Obrigatória no Modo Replace
+  if (restoreMode === 'replace') {
+    if (data.settings === undefined) {
+      errors.push('A entidade "settings" está ausente no backup. O modo de substituição integral (replace) exige todas as entidades canônicas.');
+    } else if (data.settings === null || typeof data.settings !== 'object' || Array.isArray(data.settings)) {
+      errors.push('A entidade "settings" deve ser um objeto de configuração válido.');
     }
+
+    for (const col of CANONICAL_ARRAY_COLLECTIONS) {
+      if (data[col] === undefined) {
+        errors.push(`A coleção obrigatória "${col}" está ausente no backup. Para restauração integral (modo replace), todas as coleções canônicas devem estar presentes (mesmo que vazias).`);
+      } else if (data[col] === null) {
+        errors.push(`A coleção obrigatória "${col}" não pode ser nula (null).`);
+      } else if (!Array.isArray(data[col])) {
+        errors.push(`A coleção obrigatória "${col}" deve ser uma lista (array).`);
+      }
+    }
+  }
+
+  // 3. Validação Geral de Tipos de Coleções (para todos os modos)
+  for (const col of CANONICAL_ARRAY_COLLECTIONS) {
+    if (data[col] !== undefined) {
+      if (data[col] === null) {
+        if (restoreMode !== 'replace') {
+          errors.push(`A coleção "${col}" não pode ser nula (null).`);
+        }
+      } else if (!Array.isArray(data[col])) {
+        if (restoreMode !== 'replace') {
+          errors.push(`A coleção "${col}" deve ser uma lista (array).`);
+        }
+      }
+    }
+  }
+  if (data.settings !== undefined && data.settings !== null && (typeof data.settings !== 'object' || Array.isArray(data.settings))) {
+    if (restoreMode !== 'replace') {
+      errors.push('A entidade "settings" deve ser um objeto.');
+    }
+  }
+
+  // Validação de Equipamentos
+  if (Array.isArray(data.equipment)) {
+    summary.equipmentCount = data.equipment.length;
+    const seenIds = new Set<string>();
+    data.equipment.forEach((item: any, idx: number) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        errors.push(`Equipamento na posição ${idx} não é um objeto válido.`);
+        return;
+      }
+      if (!item.id || typeof item.id !== 'string') {
+        errors.push(`Equipamento na posição ${idx} possui identificador (id) inválido ou ausente.`);
+      } else if (seenIds.has(item.id)) {
+        errors.push(`ID duplicado em equipamentos: "${item.id}".`);
+      } else {
+        seenIds.add(item.id);
+      }
+      if (!item.name || typeof item.name !== 'string') {
+        errors.push(`Equipamento "${item.id || idx}" possui nome obrigatório ausente.`);
+      }
+      if (item.purchase_value !== undefined && (isNaN(Number(item.purchase_value)) || Number(item.purchase_value) < 0)) {
+        errors.push(`Equipamento "${item.name || idx}" possui valor de compra numérico inválido.`);
+      }
+    });
   }
 
   // Validação de Custos Fixos
-  if (data.recurring_expenses !== undefined) {
-    if (!Array.isArray(data.recurring_expenses)) {
-      errors.push('A entidade "recurring_expenses" deve ser uma lista.');
-    } else {
-      summary.recurringExpensesCount = data.recurring_expenses.length;
-      const seenIds = new Set<string>();
-      data.recurring_expenses.forEach((item: any, idx: number) => {
-        if (!item || typeof item !== 'object') {
-          errors.push(`Custo fixo na posição ${idx} não é um objeto válido.`);
-          return;
-        }
-        if (!item.id || typeof item.id !== 'string') {
-          errors.push(`Custo fixo na posição ${idx} possui ID inválido.`);
-        } else if (seenIds.has(item.id)) {
-          errors.push(`ID duplicado em custos fixos: "${item.id}".`);
-        } else {
-          seenIds.add(item.id);
-        }
-        if (!item.name) errors.push(`Custo fixo "${item.id || idx}" possui nome ausente.`);
-      });
-    }
+  if (Array.isArray(data.recurring_expenses)) {
+    summary.recurringExpensesCount = data.recurring_expenses.length;
+    const seenIds = new Set<string>();
+    data.recurring_expenses.forEach((item: any, idx: number) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        errors.push(`Custo fixo na posição ${idx} não é um objeto válido.`);
+        return;
+      }
+      if (!item.id || typeof item.id !== 'string') {
+        errors.push(`Custo fixo na posição ${idx} possui ID inválido ou ausente.`);
+      } else if (seenIds.has(item.id)) {
+        errors.push(`ID duplicado em custos fixos: "${item.id}".`);
+      } else {
+        seenIds.add(item.id);
+      }
+      if (!item.name || typeof item.name !== 'string') {
+        errors.push(`Custo fixo "${item.id || idx}" possui nome ausente.`);
+      }
+    });
   }
 
   // Validação de Catálogo
-  if (data.expense_catalog !== undefined) {
-    if (!Array.isArray(data.expense_catalog)) {
-      errors.push('A entidade "expense_catalog" deve ser uma lista.');
-    } else {
-      summary.catalogCount = data.expense_catalog.length;
-      const seenIds = new Set<string>();
-      data.expense_catalog.forEach((item: any, idx: number) => {
-        if (!item.id || typeof item.id !== 'string') {
-          errors.push(`Item de catálogo na posição ${idx} possui ID inválido.`);
-        } else if (seenIds.has(item.id)) {
-          errors.push(`ID duplicado em catálogo de despesas: "${item.id}".`);
-        } else {
-          seenIds.add(item.id);
-        }
-      });
-    }
+  if (Array.isArray(data.expense_catalog)) {
+    summary.catalogCount = data.expense_catalog.length;
+    const seenIds = new Set<string>();
+    data.expense_catalog.forEach((item: any, idx: number) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        errors.push(`Item de catálogo na posição ${idx} não é um objeto válido.`);
+        return;
+      }
+      if (!item.id || typeof item.id !== 'string') {
+        errors.push(`Item de catálogo na posição ${idx} possui ID inválido ou ausente.`);
+      } else if (seenIds.has(item.id)) {
+        errors.push(`ID duplicado em catálogo de despesas: "${item.id}".`);
+      } else {
+        seenIds.add(item.id);
+      }
+      if (!item.name || typeof item.name !== 'string') {
+        errors.push(`Item de catálogo "${item.id || idx}" possui nome ausente.`);
+      }
+    });
   }
 
   // Validação de Profissionais
-  if (data.professionals !== undefined) {
-    if (!Array.isArray(data.professionals)) {
-      errors.push('A entidade "professionals" deve ser uma lista.');
-    } else {
-      summary.professionalsCount = data.professionals.length;
-      const seenIds = new Set<string>();
-      data.professionals.forEach((item: any, idx: number) => {
-        if (!item.id || typeof item.id !== 'string') {
-          errors.push(`Profissional na posição ${idx} possui ID inválido.`);
-        } else if (seenIds.has(item.id)) {
-          errors.push(`ID duplicado em profissionais: "${item.id}".`);
-        } else {
-          seenIds.add(item.id);
-        }
-      });
-    }
+  if (Array.isArray(data.professionals)) {
+    summary.professionalsCount = data.professionals.length;
+    const seenIds = new Set<string>();
+    data.professionals.forEach((item: any, idx: number) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        errors.push(`Profissional na posição ${idx} não é um objeto válido.`);
+        return;
+      }
+      if (!item.id || typeof item.id !== 'string') {
+        errors.push(`Profissional na posição ${idx} possui ID inválido ou ausente.`);
+      } else if (seenIds.has(item.id)) {
+        errors.push(`ID duplicado em profissionais: "${item.id}".`);
+      } else {
+        seenIds.add(item.id);
+      }
+      if (!item.name || typeof item.name !== 'string') {
+        errors.push(`Profissional "${item.id || idx}" possui nome ausente.`);
+      }
+    });
   }
 
   // Validação de Modelos
-  if (data.production_templates !== undefined) {
-    if (!Array.isArray(data.production_templates)) {
-      errors.push('A entidade "production_templates" deve ser uma lista.');
-    } else {
-      summary.templatesCount = data.production_templates.length;
-      const seenIds = new Set<string>();
-      data.production_templates.forEach((item: any, idx: number) => {
-        if (!item.id || typeof item.id !== 'string') {
-          errors.push(`Modelo na posição ${idx} possui ID inválido.`);
-        } else if (seenIds.has(item.id)) {
-          errors.push(`ID duplicado em modelos: "${item.id}".`);
-        } else {
-          seenIds.add(item.id);
-        }
-      });
-    }
+  if (Array.isArray(data.production_templates)) {
+    summary.templatesCount = data.production_templates.length;
+    const seenIds = new Set<string>();
+    data.production_templates.forEach((item: any, idx: number) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        errors.push(`Modelo na posição ${idx} não é um objeto válido.`);
+        return;
+      }
+      if (!item.id || typeof item.id !== 'string') {
+        errors.push(`Modelo na posição ${idx} possui ID inválido ou ausente.`);
+      } else if (seenIds.has(item.id)) {
+        errors.push(`ID duplicado em modelos: "${item.id}".`);
+      } else {
+        seenIds.add(item.id);
+      }
+      if (!item.name || typeof item.name !== 'string') {
+        errors.push(`Modelo "${item.id || idx}" possui nome ausente.`);
+      }
+    });
   }
 
   // Validação de Orçamentos
   const budgetIdsInBackup = new Set<string>();
-  if (data.budgets !== undefined) {
-    if (!Array.isArray(data.budgets)) {
-      errors.push('A entidade "budgets" deve ser uma lista.');
-    } else {
-      summary.budgetsCount = data.budgets.length;
-      data.budgets.forEach((item: any, idx: number) => {
-        if (!item || typeof item !== 'object') {
-          errors.push(`Orçamento na posição ${idx} não é um objeto válido.`);
-          return;
-        }
-        if (!item.id || typeof item.id !== 'string') {
-          errors.push(`Orçamento na posição ${idx} possui ID inválido.`);
-        } else if (budgetIdsInBackup.has(item.id)) {
-          errors.push(`ID duplicado em orçamentos: "${item.id}".`);
-        } else {
-          budgetIdsInBackup.add(item.id);
-        }
-        if (!item.title) errors.push(`Orçamento "${item.id || idx}" possui título ausente.`);
-        if (!item.client_name) errors.push(`Orçamento "${item.id || idx}" possui nome do cliente ausente.`);
-      });
-    }
+  if (Array.isArray(data.budgets)) {
+    summary.budgetsCount = data.budgets.length;
+    data.budgets.forEach((item: any, idx: number) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        errors.push(`Orçamento na posição ${idx} não é um objeto válido.`);
+        return;
+      }
+      if (!item.id || typeof item.id !== 'string') {
+        errors.push(`Orçamento na posição ${idx} possui ID inválido ou ausente.`);
+      } else if (budgetIdsInBackup.has(item.id)) {
+        errors.push(`ID duplicado em orçamentos: "${item.id}".`);
+      } else {
+        budgetIdsInBackup.add(item.id);
+      }
+      if (!item.title || typeof item.title !== 'string') errors.push(`Orçamento "${item.id || idx}" possui título ausente.`);
+      if (!item.client_name || typeof item.client_name !== 'string') errors.push(`Orçamento "${item.id || idx}" possui nome do cliente ausente.`);
+    });
   }
 
   // Validação de Propostas e Integridade Referencial
-  if (data.proposals !== undefined) {
-    if (!Array.isArray(data.proposals)) {
-      errors.push('A entidade "proposals" deve ser uma lista.');
-    } else {
-      summary.proposalsCount = data.proposals.length;
-      const seenProposalIds = new Set<string>();
-      data.proposals.forEach((item: any, idx: number) => {
-        if (!item || typeof item !== 'object') {
-          errors.push(`Proposta na posição ${idx} não é um objeto válido.`);
-          return;
-        }
-        if (!item.id || typeof item.id !== 'string') {
-          errors.push(`Proposta na posição ${idx} possui ID inválido.`);
-        } else if (seenProposalIds.has(item.id)) {
-          errors.push(`ID duplicado em propostas: "${item.id}".`);
+  if (Array.isArray(data.proposals)) {
+    summary.proposalsCount = data.proposals.length;
+    const seenProposalIds = new Set<string>();
+    data.proposals.forEach((item: any, idx: number) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        errors.push(`Proposta na posição ${idx} não é um objeto válido.`);
+        return;
+      }
+      if (!item.id || typeof item.id !== 'string') {
+        errors.push(`Proposta na posição ${idx} possui ID inválido ou ausente.`);
+      } else if (seenProposalIds.has(item.id)) {
+        errors.push(`ID duplicado em propostas: "${item.id}".`);
+      } else {
+        seenProposalIds.add(item.id);
+      }
+
+      if (!item.budget_id || typeof item.budget_id !== 'string') {
+        errors.push(`Proposta "${item.id || idx}" não possui referência de orçamento (budget_id).`);
+      } else if (!budgetIdsInBackup.has(item.budget_id)) {
+        if (currentDb) {
+          const exists = currentDb.prepare('SELECT id FROM budgets WHERE id = ?').get(item.budget_id);
+          if (!exists) {
+            errors.push(`Proposta "${item.id}" faz referência a orçamento inexistente ("${item.budget_id}").`);
+          }
         } else {
-          seenProposalIds.add(item.id);
+          warnings.push(`Proposta "${item.id}" faz referência a orçamento "${item.budget_id}" ausente no backup.`);
         }
+      }
 
-        // Checar integridade referencial: proposta deve apontar para orçamento
-        if (!item.budget_id || typeof item.budget_id !== 'string') {
-          errors.push(`Proposta "${item.id || idx}" não possui referência de orçamento (budget_id).`);
-        } else if (!budgetIdsInBackup.has(item.budget_id)) {
-          if (currentDb) {
-            const exists = currentDb.prepare('SELECT id FROM budgets WHERE id = ?').get(item.budget_id);
-            if (!exists) {
-              errors.push(`Proposta "${item.id}" faz referência a orçamento inexistente ("${item.budget_id}").`);
-            }
-          } else {
-            warnings.push(`Proposta "${item.id}" faz referência a orçamento "${item.budget_id}" ausente no backup.`);
-          }
-        }
+      if (item.total_price !== undefined && (isNaN(Number(item.total_price)) || Number(item.total_price) < 0)) {
+        errors.push(`Proposta "${item.id || idx}" possui valor total monetário negativo ou inválido.`);
+      }
 
-        if (item.total_price !== undefined && (isNaN(Number(item.total_price)) || Number(item.total_price) < 0)) {
-          errors.push(`Proposta "${item.id || idx}" possui valor total monetário negativo ou inválido.`);
+      if (item.cash_discount_pct !== undefined && item.cash_discount_pct !== null && item.cash_discount_pct !== '') {
+        const discountNum = Number(item.cash_discount_pct);
+        if (isNaN(discountNum) || discountNum < 0 || discountNum > 100) {
+          errors.push(`Proposta "${item.id || idx}" possui percentual de desconto à vista inválido (${item.cash_discount_pct}). O valor deve ser numérico entre 0% e 100%.`);
         }
-
-        if (item.cash_discount_pct !== undefined && item.cash_discount_pct !== null && item.cash_discount_pct !== '') {
-          const discountNum = Number(item.cash_discount_pct);
-          if (isNaN(discountNum) || discountNum < 0 || discountNum > 100) {
-            errors.push(`Proposta "${item.id || idx}" possui percentual de desconto à vista inválido (${item.cash_discount_pct}). O valor deve ser numérico entre 0% e 100%.`);
-          }
-        }
-      });
-    }
+      }
+    });
   }
 
   return {
@@ -1384,28 +1519,48 @@ export function exportBackupData(dbInstance?: DatabaseSync): any {
 
 export function restoreBackupData(
   payload: any,
-  options: { restoreMode?: 'replace' | 'merge' } = {},
+  options: {
+    restoreMode?: 'replace' | 'merge';
+    skipSafetyBackup?: boolean;
+    safetyBackupDir?: string;
+  } = {},
   dbOverride?: DatabaseSync
 ): { success: boolean; message: string; summary: any } {
   const db = dbOverride || getDb();
   const restoreMode = options.restoreMode || 'replace';
-  const data = payload?.data;
-  if (!data || typeof data !== 'object') {
-    throw new Error('Payload de backup corrompido ou sem a chave "data".');
+
+  // 1. Validação integral prévia obrigatória antes de qualquer alteração no banco
+  const validation = validateBackupPayload(payload, db, { restoreMode });
+  if (!validation.isValid) {
+    throw new Error(`Validação de backup falhou: ${validation.errors.join('; ')}`);
   }
 
-  // Criar snapshot prévio de segurança em disco antes de alterar o banco (se não for banco in-memory)
-  try {
-    const backupDir = path.resolve(process.cwd(), 'data');
-    if (fs.existsSync(backupDir)) {
-      const safetyBackupPath = path.resolve(backupDir, `safety_pre_restore_${Date.now()}.sqlite`);
-      db.exec(`VACUUM INTO '${safetyBackupPath.replace(/'/g, "''")}';`);
+  // 2. Proteção de isolamento de teste: nunca modificar banco de produção em ambiente de teste
+  if (process.env.NODE_ENV === 'test' && (db as any).__isPersistentProductionDb) {
+    throw new Error('[TEST GUARD] Operação destrutiva bloqueada: restoreBackupData não pode ser executada contra o banco persistente real em ambiente de teste.');
+  }
+
+  // 3. Backup preventivo de segurança obrigatório antes de restauração destrutiva (modo replace)
+  if (restoreMode === 'replace') {
+    if (options.skipSafetyBackup && (db as any).__isPersistentProductionDb) {
+      throw new Error('O backup de segurança é estritamente obrigatório para o banco de dados persistente de produção e não pode ser ignorado.');
     }
-  } catch (vacuumErr) {
-    // Seguro em caso de banco in-memory de testes
+
+    if (!options.skipSafetyBackup) {
+      try {
+        createSafetyBackup(db, options.safetyBackupDir);
+      } catch (backupErr: any) {
+        console.error('[RESTORE SAFETY BACKUP FAILED]', backupErr);
+        throw new Error(
+          `Falha de segurança preventiva: não foi possível criar o backup de segurança obrigatório antes da restauração. A restauração foi cancelada e nenhum dado foi alterado.`
+        );
+      }
+    }
   }
 
-  // Modo commit: Restaurar integralmente dentro de transação SQLite com rollback
+  const data = payload?.data;
+
+  // 4. Modo commit: Restaurar integralmente dentro de transação SQLite com rollback
   db.exec('BEGIN TRANSACTION;');
 
   try {
@@ -1755,9 +1910,15 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
     const db = getDb();
     const payload = req.body?.payload ? req.body.payload : req.body;
     const mode = (req.query.mode as string) || req.body?.mode || 'preview';
-    const restoreMode = ((req.query.restoreMode as string) || req.body?.restoreMode || 'replace') as 'replace' | 'merge';
 
-    const validation = validateBackupPayload(payload, db);
+    let restoreMode: 'replace' | 'merge';
+    try {
+      restoreMode = parseAndValidateRestoreMode(req.query.restoreMode, req.body?.restoreMode);
+    } catch (modeErr: any) {
+      return res.status(400).json({ error: modeErr.message });
+    }
+
+    const validation = validateBackupPayload(payload, db, { restoreMode });
 
     if (mode === 'preview') {
       return res.json({

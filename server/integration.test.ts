@@ -5,49 +5,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import express from 'express';
-import { apiRouter, exportBackupData, restoreBackupData, validateBackupPayload, parseNumericField } from './api.js';
+import { apiRouter, exportBackupData, restoreBackupData, validateBackupPayload, parseNumericField, createSafetyBackup } from './api.js';
 import { setDbInstance, runMigrations, clearSampleData, restoreSampleData, CANONICAL_SAMPLE_IDS } from './db.js';
 import { generateCommercialProposalPdf } from '../src/utils/pdfGenerator.js';
 import { calculateProjectPricing } from '../src/financial/engine.js';
 
-// Utilitário para instanciar servidor de testes efêmero com isolamento total
-async function withTestServer(
-  testFn: (ctx: { baseUrl: string; db: DatabaseSync; dbPath: string }) => Promise<void>
-) {
-  const dbPath = path.resolve('/tmp', `test_${crypto.randomUUID()}.sqlite`);
-  const db = new DatabaseSync(dbPath);
-  db.exec('PRAGMA journal_mode = WAL;');
-  db.exec('PRAGMA foreign_keys = ON;');
-  runMigrations(db);
-
-  setDbInstance(db);
-
-  const app = express();
-  app.use(express.json({ limit: '20mb' }));
-  app.use('/api', apiRouter);
-
-  const server = await new Promise<any>((resolve) => {
-    const s = app.listen(0, () => resolve(s));
-  });
-
-  const port = server.address().port;
-  const baseUrl = `http://127.0.0.1:${port}/api`;
-
-  try {
-    await testFn({ baseUrl, db, dbPath });
-  } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    setDbInstance(null);
-    db.close();
-    try {
-      if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
-      const walPath = `${dbPath}-wal`;
-      if (fs.existsSync(walPath)) fs.unlinkSync(walPath);
-      const shmPath = `${dbPath}-shm`;
-      if (fs.existsSync(shmPath)) fs.unlinkSync(shmPath);
-    } catch {}
-  }
-}
+import { withTestServer } from './test-helpers.js';
 
 // ============================================================================
 // PRIORIDADE 1: PROTEÇÃO DE DADOS REAIS E IDENTIFICAÇÃO CANÔNICA DE DEMO
@@ -520,5 +483,429 @@ test('P5 - Exportação SQLite atômica via VACUUM INTO gera arquivo íntegro co
 
     checkDb.close();
     fs.unlinkSync(tempCheckPath);
+  });
+});
+
+// ============================================================================
+// ETAPA 1: IMPEDIR RESTAURAÇÃO DE BACKUPS JSON INCOMPLETOS
+// ============================================================================
+
+test('E1.1 - Backup completo válido com todas as coleções canônicas é restaurado com sucesso no modo replace', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    // 1. Inserir registro local inicial
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)').run('eq_old', 'Câmera Velha', 1000, 100);
+
+    const fullPayload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      exported_at: '2026-10-18T10:00:00.000Z',
+      data: {
+        settings: { studio_name: 'Studio Cinema Novo' },
+        equipment: [{ id: 'eq_new_1', name: 'Sony FX6', purchase_value: 35000, residual_value: 5000 }],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [{ id: 'pro_new_1', name: 'Diretor de Fotografia', specialty: 'DOP', hiring_type: 'daily', default_value: 1200 }],
+        production_templates: [],
+        budgets: [{ id: 'bud_new_1', code: 'ORC-2026-N1', title: 'Comercial TV', client_name: 'Anunciante X' }],
+        proposals: [{
+          id: 'prop_new_1',
+          budget_id: 'bud_new_1',
+          proposal_code: 'PROP-2026-N1',
+          client_name: 'Anunciante X',
+          project_title: 'Comercial TV',
+          total_price: 25000,
+          cash_discount_pct: 5,
+        }],
+      },
+    };
+
+    const res = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(fullPayload),
+    });
+    assert.equal(res.status, 200);
+
+    // Consulta real no banco: registros anteriores foram substituídos e novos foram inseridos
+    const oldEq = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_old');
+    assert.equal(oldEq, undefined, 'Registro pré-existente foi substituído');
+
+    const newEq = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_new_1') as any;
+    assert.ok(newEq);
+    assert.equal(newEq.name, 'Sony FX6');
+
+    const newProp = db.prepare('SELECT * FROM proposals WHERE id = ?').get('prop_new_1') as any;
+    assert.ok(newProp);
+    assert.equal(newProp.total_price, 25000);
+  });
+});
+
+test('E1.2 - Backup no modo replace com coleção obrigatória ausente é rejeitado e nenhum dado existente é apagado', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    // 1. Inserir registros que NÃO podem ser apagados
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)').run('eq_protegido', 'Câmera Intacta', 20000, 2000);
+    const countBefore = (db.prepare('SELECT count(*) as c FROM equipment').get() as any).c;
+
+    // 2. Payload omitindo coleções obrigatórias (ex: sem 'professionals' e sem 'production_templates')
+    const partialPayload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Tentativa Incompleta' },
+        equipment: [{ id: 'eq_incompleto', name: 'Lente Incompleta' }],
+        // recurring_expenses ausente
+        // expense_catalog ausente
+        // professionals ausente
+        // production_templates ausente
+        // budgets ausente
+        // proposals ausente
+      },
+    };
+
+    const res = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(partialPayload),
+    });
+
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as any;
+    assert.match(body.details.join(' '), /coleção obrigatória/i);
+
+    // 3. Consulta real no banco antes e depois: NENHUM dado foi apagado ou alterado
+    const countAfter = (db.prepare('SELECT count(*) as c FROM equipment').get() as any).c;
+    assert.equal(countAfter, countBefore, 'Contagem de registros deve permanecer idêntica');
+    const eq = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_protegido');
+    assert.ok(eq, 'Item original deve permanecer intacto');
+  });
+});
+
+test('E1.3 - Backup com coleção com null ou tipo incorreto é rejeitado e nenhum dado é apagado', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)').run('eq_intacto_null', 'Equipamento Intacto', 5000, 500);
+
+    // Payload com coleção obrigatória com valor null
+    const nullCollectionPayload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Test' },
+        equipment: null, // INVÁLIDO (null)
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    const resNull = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(nullCollectionPayload),
+    });
+    assert.equal(resNull.status, 400);
+
+    // Payload com coleção com tipo incorreto (string em vez de array)
+    const wrongTypePayload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Test' },
+        equipment: 'string-invalida-nao-array', // INVÁLIDO
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    const resWrong = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(wrongTypePayload),
+    });
+    assert.equal(resWrong.status, 400);
+
+    // Consulta real no banco: registro permanece intacto
+    const item = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_intacto_null');
+    assert.ok(item, 'Nenhum dado é apagado quando a coleção for null ou tipo incorreto');
+  });
+});
+
+test('E1.4 - Backup com registro malformado é rejeitado na validação antes de modificar o banco', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)').run('eq_original_val', 'Equipamento Validação', 6000, 600);
+
+    // Registro de equipamento com valor de compra negativo
+    const malformedPayload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Test' },
+        equipment: [{ id: 'eq_bad', name: 'Lente Quebrada', purchase_value: -500 }], // INVÁLIDO
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    const res = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(malformedPayload),
+    });
+    assert.equal(res.status, 400);
+
+    const item = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_original_val');
+    assert.ok(item, 'Item original não foi modificado');
+  });
+});
+
+test('E1.5 - Backup válido com coleção canônica vazia ([]) é processado corretamente', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    const emptyCollectionsPayload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Estúdio Vazio Válido' },
+        equipment: [{ id: 'eq_unico', name: 'Microfone Shure', purchase_value: 1200 }],
+        recurring_expenses: [],
+        expense_catalog: [], // Coleção vazia válida
+        professionals: [], // Coleção vazia válida
+        production_templates: [], // Coleção vazia válida
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    const res = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(emptyCollectionsPayload),
+    });
+    assert.equal(res.status, 200);
+
+    const eq = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_unico') as any;
+    assert.ok(eq);
+    assert.equal(eq.name, 'Microfone Shure');
+
+    const tplCount = (db.prepare('SELECT count(*) as c FROM production_templates').get() as any).c;
+    assert.equal(tplCount, 0, 'Coleções vazias no backup resultam em tabelas vazias no modo replace');
+  });
+});
+
+// ============================================================================
+// ETAPA 3: BACKUP DE SEGURANÇA OBRIGATÓRIO ANTES DE RESTAURAÇÃO DESTRUTIVA
+// ============================================================================
+
+test('E3.1 - Backup de segurança criado com sucesso no disco antes de qualquer alteração destrutiva', async () => {
+  await withTestServer(async ({ db }) => {
+    const backupDir = path.resolve('/tmp', `safety_test_${crypto.randomUUID()}`);
+    fs.mkdirSync(backupDir, { recursive: true });
+
+    db.prepare('UPDATE settings SET studio_name = ? WHERE id = 1').run('Studio Original Pre-Restore');
+
+    const payload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Novo Pós-Restore' },
+        equipment: [],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    const result = restoreBackupData(payload, { restoreMode: 'replace', safetyBackupDir: backupDir }, db);
+    assert.equal(result.success, true);
+
+    // Verifica que o arquivo de backup de segurança foi gerado no diretório
+    const files = fs.readdirSync(backupDir).filter((f) => f.startsWith('safety_pre_restore_') && f.endsWith('.sqlite'));
+    assert.equal(files.length, 1, 'Deve existir exatamente 1 arquivo de safety backup');
+
+    const safetyFilePath = path.resolve(backupDir, files[0]);
+    assert.ok(fs.statSync(safetyFilePath).size > 0, 'Arquivo deve ter tamanho maior que zero');
+
+    // Valida que o backup contém os dados originais pré-restauração
+    const safetyDb = new DatabaseSync(safetyFilePath);
+    const integrity = (safetyDb.prepare('PRAGMA integrity_check').get() as any).integrity_check;
+    assert.equal(integrity, 'ok', 'Backup de segurança deve ser íntegro');
+    const origStudio = (safetyDb.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any).studio_name;
+    assert.equal(origStudio, 'Studio Original Pre-Restore', 'Backup de segurança deve conter o estado ANTES da restauração');
+    safetyDb.close();
+
+    // Limpeza
+    fs.rmSync(backupDir, { recursive: true, force: true });
+  });
+});
+
+test('E3.2 - Falha ao criar backup de segurança impede qualquer alteração destrutiva no banco', async () => {
+  await withTestServer(async ({ db }) => {
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)').run('eq_nunca_apagar', 'Item Precioso', 50000, 10000);
+
+    const payload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Tentativa Sem Backup' },
+        equipment: [],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    // Caminho impossível / inválido para provocar erro de escrita do backup
+    const invalidDir = '/dev/null/caminho_impossivel_sem_permissao';
+
+    assert.throws(
+      () => {
+        restoreBackupData(payload, { restoreMode: 'replace', safetyBackupDir: invalidDir }, db);
+      },
+      (err: any) => {
+        assert.match(err.message, /Falha de segurança preventiva/i);
+        return true;
+      }
+    );
+
+    // Consulta real no banco: o item precioso NÃO foi apagado
+    const item = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_nunca_apagar');
+    assert.ok(item, 'Quando a criação do backup de segurança falha, NENHUM dado é apagado ou alterado');
+  });
+});
+
+// ============================================================================
+// ETAPA 4: VALIDAÇÃO EM TEMPO DE EXECUÇÃO DO PARÂMETRO restoreMode
+// ============================================================================
+
+test('E4.1 - Validação em tempo de execução de restoreMode: aceita replace e merge', async () => {
+  await withTestServer(async ({ baseUrl }) => {
+    const validPayload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'FBonilha Test' },
+        equipment: [],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    // 1. replace aceito
+    const resReplace = await fetch(`${baseUrl}/backup/import-json?mode=preview&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validPayload),
+    });
+    assert.equal(resReplace.status, 200);
+
+    // 2. merge aceito
+    const resMerge = await fetch(`${baseUrl}/backup/import-json?mode=preview&restoreMode=merge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validPayload),
+    });
+    assert.equal(resMerge.status, 200);
+
+    // 3. ausente aceito (assume padrão documentado replace)
+    const resAbsent = await fetch(`${baseUrl}/backup/import-json?mode=preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validPayload),
+    });
+    assert.equal(resAbsent.status, 200);
+  });
+});
+
+test('E4.2 - Validação de restoreMode: rejeita desconhecido, string vazia, tipo incorreto e conflito ambíguo', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)').run('eq_intacto_mode', 'Câmera Intacta Mode', 8000, 800);
+
+    const validPayload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'FBonilha Test' },
+        equipment: [],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    // 1. Valor desconhecido rejeitado
+    const resUnknown = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=super_wipe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validPayload),
+    });
+    assert.equal(resUnknown.status, 400);
+    const bodyUnknown = (await resUnknown.json()) as any;
+    assert.match(bodyUnknown.error, /Modo de restauração "super_wipe" inválido/);
+
+    // 2. String vazia rejeitada
+    const resEmpty = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validPayload),
+    });
+    assert.equal(resEmpty.status, 400);
+    const bodyEmpty = (await resEmpty.json()) as any;
+    assert.match(bodyEmpty.error, /não pode ser uma string vazia/);
+
+    // 3. Tipo incorreto rejeitado (passando número via body)
+    const resType = await fetch(`${baseUrl}/backup/import-json?mode=commit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload: validPayload, restoreMode: 12345 }),
+    });
+    assert.equal(resType.status, 400);
+    const bodyType = (await resType.json()) as any;
+    assert.match(bodyType.error, /deve ser uma string/);
+
+    // 4. Conflito ambíguo (query string = replace, body = merge)
+    const resAmbiguous = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload: validPayload, restoreMode: 'merge' }),
+    });
+    assert.equal(resAmbiguous.status, 400);
+    const bodyAmbiguous = (await resAmbiguous.json()) as any;
+    assert.match(bodyAmbiguous.error, /ambíguo/);
+
+    // 5. Confirma que NENHUM dado foi alterado
+    const item = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_intacto_mode');
+    assert.ok(item, 'Nenhum dado é alterado quando a validação de restoreMode falha');
   });
 });

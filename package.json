@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/financial/engine.test.ts server/audit.test.ts server/integration.test.ts"
+    "test": "NODE_ENV=test tsx --test src/financial/engine.test.ts server/audit.test.ts server/integration.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

@@ -54,7 +54,13 @@ export function setDbInstance(db: DatabaseSync | null): void {
 
 export function getDb(): DatabaseSync {
   if (!dbInstance) {
+    if (process.env.NODE_ENV === 'test') {
+      throw new Error(
+        '[TEST GUARD] Tentativa não autorizada de acessar o banco de dados persistente real (DB_PATH) em ambiente de teste. Todo teste deve utilizar uma instância isolada com withTestServer() ou setDbInstance().'
+      );
+    }
     dbInstance = new DatabaseSync(DB_PATH);
+    (dbInstance as any).__isPersistentProductionDb = true;
     // Habilitar WAL mode e foreign keys
     dbInstance.exec('PRAGMA journal_mode = WAL;');
     dbInstance.exec('PRAGMA foreign_keys = ON;');
@@ -317,6 +323,9 @@ export function runMigrations(db: DatabaseSync) {
 }
 
 export function clearSampleData(db: DatabaseSync) {
+  if (process.env.NODE_ENV === 'test' && (db as any).__isPersistentProductionDb) {
+    throw new Error('[TEST GUARD] Operação destrutiva bloqueada: clearSampleData não pode ser executada contra o banco persistente real em ambiente de teste.');
+  }
   db.exec('BEGIN TRANSACTION;');
   try {
     for (const [table, ids] of Object.entries(CANONICAL_SAMPLE_IDS)) {
@@ -357,6 +366,9 @@ export function listSampleData(db: DatabaseSync): Array<{ table: string; categor
 }
 
 export function restoreSampleData(db: DatabaseSync) {
+  if (process.env.NODE_ENV === 'test' && (db as any).__isPersistentProductionDb) {
+    throw new Error('[TEST GUARD] Operação destrutiva bloqueada: restoreSampleData não pode ser executada contra o banco persistente real em ambiente de teste.');
+  }
   seedInitialData(db);
 }
 
