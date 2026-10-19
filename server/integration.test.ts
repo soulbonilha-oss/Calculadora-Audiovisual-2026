@@ -1892,5 +1892,29 @@ test('RC5.9 - createSafetyBackup: falha ao abrir o snapshot remove o arquivo par
   });
 });
 
+test('RC5.10 - Fila de mutex: uma falha na primeira execução não bloqueia nem corrompe a segunda chamada', async () => {
+  let firstExecuted = false;
+  let secondExecuted = false;
+
+  const results = await Promise.allSettled([
+    withTestServer(async () => {
+      firstExecuted = true;
+      throw new Error('Falha simulada na primeira tarefa serializada do mutex');
+    }),
+    withTestServer(async ({ db, baseUrl }) => {
+      secondExecuted = true;
+      const res = await fetch(`${baseUrl}/settings`);
+      assert.equal(res.status, 200);
+      assert.ok(db);
+    }),
+  ]);
+
+  assert.equal(firstExecuted, true, 'A primeira tarefa deve ter sido executada');
+  assert.equal(secondExecuted, true, 'A segunda tarefa deve ter sido executada mesmo após falha da primeira');
+  assert.equal(results[0].status, 'rejected');
+  assert.equal((results[0] as PromiseRejectedResult).reason.message, 'Falha simulada na primeira tarefa serializada do mutex');
+  assert.equal(results[1].status, 'fulfilled');
+});
+
 
 
