@@ -1842,5 +1842,55 @@ test('RC5.8 - createSafetyBackup: falha na verificação de integridade remove a
   });
 });
 
+test('RC5.9 - createSafetyBackup: falha ao abrir o snapshot remove o arquivo parcial gerado e não modifica o banco', async () => {
+  await withTestServer(async ({ db, backupDir }) => {
+    // 1. Estado inicial protegido
+    db.prepare('UPDATE settings SET studio_name = ? WHERE id = 1').run('Studio Original Open Fail');
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)')
+      .run('eq_intacto_59', 'Câmera Intacta 59', 15000, 1500);
+
+    const preexistingFile = path.resolve(backupDir, 'preexisting_snapshot_file.txt');
+    fs.writeFileSync(preexistingFile, 'snapshot anterior preservado');
+
+    // Intercepta DatabaseSync.prototype.prepare para simular erro de abertura/leitura de arquivo corrompido
+    const origPrepare = DatabaseSync.prototype.prepare;
+    DatabaseSync.prototype.prepare = function (sql: string) {
+      if (typeof sql === 'string' && sql.includes('PRAGMA integrity_check')) {
+        throw new Error('Falha catastrófica ao abrir snapshot: disk I/O error');
+      }
+      return origPrepare.apply(this, arguments as any);
+    };
+
+    try {
+      assert.throws(
+        () => {
+          createSafetyBackup(db, backupDir);
+        },
+        (err: any) => {
+          assert.match(err.message, /disk I\/O error/);
+          return true;
+        }
+      );
+
+      // Comprova que o arquivo temporário de backup foi removido
+      const safetyFiles = fs.readdirSync(backupDir).filter((f) => f.startsWith('safety_pre_restore_'));
+      assert.equal(safetyFiles.length, 0, 'Arquivo parcial deve ser removido após erro ao abrir');
+
+      // Comprova que arquivos preexistentes foram mantidos
+      assert.ok(fs.existsSync(preexistingFile), 'Arquivo preexistente legítimo não foi removido');
+
+      // Comprova que os dados originais no banco não foram alterados
+      const studio = (db.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any).studio_name;
+      assert.equal(studio, 'Studio Original Open Fail');
+
+      const eq = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_intacto_59') as any;
+      assert.ok(eq);
+      assert.equal(eq.name, 'Câmera Intacta 59');
+    } finally {
+      DatabaseSync.prototype.prepare = origPrepare;
+    }
+  });
+});
+
 
 
