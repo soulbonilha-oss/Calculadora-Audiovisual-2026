@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Save, SlidersHorizontal, CheckCircle2 } from 'lucide-react';
 import { StudioSettings } from '../../types';
 
@@ -14,6 +14,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [form, setForm] = useState<Partial<StudioSettings>>(settings || {});
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (settings) {
+      setForm(settings);
+    }
+  }, [settings]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -202,9 +208,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 type="number"
                 step="0.5"
                 min="0"
-                value={form.default_profit_margin_pct ?? 25}
+                value={form.default_profit_margin_pct !== undefined ? form.default_profit_margin_pct : 25}
                 onChange={(e) =>
-                  setForm({ ...form, default_profit_margin_pct: parseFloat(e.target.value) || 0 })
+                  setForm({ ...form, default_profit_margin_pct: e.target.value === '' ? ('' as any) : (isNaN(parseFloat(e.target.value)) ? 0 : parseFloat(e.target.value)) })
                 }
                 className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-700 focus:outline-none"
               />
@@ -218,9 +224,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 type="number"
                 step="0.1"
                 min="0"
-                value={form.default_tax_pct ?? 6}
+                value={form.default_tax_pct !== undefined ? form.default_tax_pct : 6}
                 onChange={(e) =>
-                  setForm({ ...form, default_tax_pct: parseFloat(e.target.value) || 0 })
+                  setForm({ ...form, default_tax_pct: e.target.value === '' ? ('' as any) : (isNaN(parseFloat(e.target.value)) ? 0 : parseFloat(e.target.value)) })
                 }
                 className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-700 focus:outline-none"
               />
@@ -234,9 +240,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 type="number"
                 step="0.1"
                 min="0"
-                value={form.default_financial_fee_pct ?? 2.5}
+                value={form.default_financial_fee_pct !== undefined ? form.default_financial_fee_pct : 2.5}
                 onChange={(e) =>
-                  setForm({ ...form, default_financial_fee_pct: parseFloat(e.target.value) || 0 })
+                  setForm({ ...form, default_financial_fee_pct: e.target.value === '' ? ('' as any) : (isNaN(parseFloat(e.target.value)) ? 0 : parseFloat(e.target.value)) })
                 }
                 className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-700 focus:outline-none"
               />
@@ -250,9 +256,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 type="number"
                 step="1"
                 min="0"
-                value={form.default_cash_discount_pct ?? 10}
+                value={form.default_cash_discount_pct !== undefined ? form.default_cash_discount_pct : 10}
                 onChange={(e) =>
-                  setForm({ ...form, default_cash_discount_pct: parseFloat(e.target.value) || 0 })
+                  setForm({ ...form, default_cash_discount_pct: e.target.value === '' ? ('' as any) : (isNaN(parseFloat(e.target.value)) ? 0 : parseFloat(e.target.value)) })
                 }
                 className="w-full px-3 py-2 text-xs font-mono border border-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-700 focus:outline-none"
               />

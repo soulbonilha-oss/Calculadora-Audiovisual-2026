@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
-import { validateBackupPayload } from './api.js';
+import express from 'express';
+import { apiRouter, validateBackupPayload } from './api.js';
 import { generateCommercialProposalPdf } from '../src/utils/pdfGenerator.js';
+import { runMigrations, clearSampleData, listSampleData, restoreSampleData, getDb, setDbInstance } from './db.js';
 
 // ============================================================================
 // SUÍTE DE AUDITORIA 1: PERSISTÊNCIA, MIGRAÇÕES E SNAPSHOTS IMUTÁVEIS (SEÇÃO 8)
@@ -379,3 +380,217 @@ test('Auditoria 9.2 - Geração de PDF com 0% de desconto e parcela única', () 
   const pdfOutput = doc.output();
   assert.ok(pdfOutput.length > 500);
 });
+
+// ============================================================================
+// SUÍTE DE AUDITORIA 6: PROTEÇÃO DE DADOS REAIS E MIGRAÇÃO DEMO (PRIORIDADE 1)
+// ============================================================================
+test('Auditoria P1.1 - Proteção de Cadastros Reais: Usuário com prefixo eq_ não é excluído em clearSampleData', () => {
+  const db = new DatabaseSync(':memory:');
+  runMigrations(db);
+
+  // Insere um item cadastrado pelo usuário com prefixo eq_ (comportamento padrão do app)
+  db.prepare(`
+    INSERT INTO equipment (id, name, category, purchase_value, residual_value, is_sample, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+  `).run('eq_usuario_camera_red', 'RED Komodo 6K Própria', 'Câmeras', 45000.0, 5000.0, 0);
+
+  // Verifica que existe
+  const beforeCount = db.prepare('SELECT count(*) as count FROM equipment').get() as any;
+  assert.ok(beforeCount.count > 1);
+
+  // Executa listSampleData e garante que o item do usuário NÃO consta na lista
+  const sampleList = listSampleData(db);
+  const userItemInSamples = sampleList.find((s) => s.id === 'eq_usuario_camera_red');
+  assert.equal(userItemInSamples, undefined, 'Cadastro real do usuário jamais deve ser listado como amostra');
+
+  // Executa clearSampleData
+  clearSampleData(db);
+
+  // Verifica que o item do usuário PERMANECE intacto no banco
+  const userItemAfter = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_usuario_camera_red') as any;
+  assert.ok(userItemAfter, 'Item do usuário com prefixo eq_ DEVE ser rigorosamente preservado');
+  assert.equal(userItemAfter.name, 'RED Komodo 6K Própria');
+
+  // Verifica que os itens de demonstração oficiais foram excluídos
+  const canonicalAfter = db.prepare("SELECT * FROM equipment WHERE id = 'eq_camera_fx3'").get();
+  assert.equal(canonicalAfter, undefined, 'Equipamento canônico deve ter sido removido');
+
+  db.close();
+});
+
+test('Auditoria P1.2 - Imutabilidade: clearSampleData NUNCA afeta orçamentos salvos ou propostas emitidas', () => {
+  const db = new DatabaseSync(':memory:');
+  runMigrations(db);
+
+  // Cadastrar orçamento e proposta comercial
+  db.prepare(`
+    INSERT INTO budgets (id, code, title, client_name, equipment_snapshot_json, calculated_summary_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+  `).run('bud_user_001', 'ORC-2026-999', 'Filme Publicitário', 'Cliente Fiel', '[]', '{}');
+
+  db.prepare(`
+    INSERT INTO proposals (
+      id, budget_id, proposal_code, client_name, project_title, total_price, cash_price,
+      cash_discount_pct, installment_count, installment_value, issue_date, valid_until_date, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  `).run('prop_user_001', 'bud_user_001', 'PROP-2026-999', 'Cliente Fiel', 'Filme Publicitário', 10000, 9000, 10, 2, 5000, '2026-10-18', '2026-10-25');
+
+  // Executar limpeza de demonstrativos
+  clearSampleData(db);
+
+  // Garantir que orçamento e proposta permanecem 100% intactos
+  const b = db.prepare('SELECT * FROM budgets WHERE id = ?').get('bud_user_001') as any;
+  const p = db.prepare('SELECT * FROM proposals WHERE id = ?').get('prop_user_001') as any;
+  assert.ok(b, 'Orçamento não pode ser removido pela limpeza de demonstrativos');
+  assert.ok(p, 'Proposta não pode ser removida pela limpeza de demonstrativos');
+
+  db.close();
+});
+
+// ============================================================================
+// SUÍTE DE AUDITORIA 7: PRESERVAÇÃO DE VALORES ZERO (PRIORIDADE 2)
+// ============================================================================
+test('Auditoria P2.1 - Preservação de ZERO: 0% desconto à vista e parcela única 1x no backup e validação', () => {
+  const payloadWithZeroes = {
+    app: 'FBonilha.mov',
+    version: '2.0.0',
+    schema_version: 3,
+    exported_at: '2026-10-18T12:00:00.000Z',
+    data: {
+      settings: {
+        id: 1,
+        studio_name: 'FBonilha.mov',
+        default_cash_discount_pct: 0,
+        default_installments: 1,
+        default_tax_pct: 0,
+        default_financial_fee_pct: 0,
+      },
+      budgets: [
+        { id: 'b_zero', code: 'ORC-0', title: 'Projeto Sem Impostos', client_name: 'Cliente Zero' }
+      ],
+      proposals: [
+        {
+          id: 'p_zero',
+          budget_id: 'b_zero',
+          proposal_code: 'P-ZERO',
+          client_name: 'Cliente Zero',
+          project_title: 'Projeto Sem Impostos',
+          total_price: 5000.0,
+          cash_price: 5000.0,
+          cash_discount_pct: 0,
+          installment_count: 1,
+          installment_value: 5000.0,
+          issue_date: '2026-10-18',
+          valid_until_date: '2026-10-25',
+        }
+      ]
+    }
+  };
+
+  const validation = validateBackupPayload(payloadWithZeroes);
+  assert.equal(validation.isValid, true);
+  assert.equal(validation.summary.proposalsCount, 1);
+});
+
+// ============================================================================
+// SUÍTE DE AUDITORIA 8: INTEGRAÇÃO HTTP DAS ROTAS REAIS (PRIORIDADE 5)
+// ============================================================================
+test('Auditoria P5.1 - HTTP API: GET /demo/samples lista os registros canônicos oficiais', async () => {
+  const app = express();
+  app.use('/api', apiRouter);
+  const server = app.listen(0);
+  const port = (server.address() as any).port;
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/demo/samples`);
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as any;
+    assert.ok(data.count >= 20, 'Deve conter os itens canônicos oficiais da FBonilha');
+    assert.ok(Array.isArray(data.samples));
+    const fx3 = data.samples.find((s: any) => s.id === 'eq_camera_fx3');
+    assert.ok(fx3, 'FX3 deve estar listada nos demonstrativos');
+  } finally {
+    server.close();
+  }
+});
+
+test('Auditoria P5.2 - HTTP API: Preservação de valores ZERO em PUT /settings e cálculos', async () => {
+  const app = express();
+  app.use('/api', apiRouter);
+  const server = app.listen(0);
+  const port = (server.address() as any).port;
+
+  try {
+    // 1. Atualizar settings com valores 0
+    const updateRes = await fetch(`http://127.0.0.1:${port}/api/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        default_cash_discount_pct: 0,
+        default_installments: 1,
+        default_tax_pct: 0,
+        default_financial_fee_pct: 0,
+      }),
+    });
+    assert.equal(updateRes.status, 200);
+    const updated = (await updateRes.json()) as any;
+    assert.equal(updated.default_cash_discount_pct, 0, 'Desconto padrão 0% deve ser preservado');
+    assert.equal(updated.default_installments, 1, '1 parcela deve ser preservada');
+    assert.equal(updated.default_tax_pct, 0, '0% imposto deve ser preservado');
+    assert.equal(updated.default_financial_fee_pct, 0, '0% taxa financeira deve ser preservada');
+
+    // 2. Restaurar para o padrão FBonilha para não poluir testes posteriores
+    await fetch(`http://127.0.0.1:${port}/api/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        default_cash_discount_pct: 10,
+        default_installments: 4,
+        default_tax_pct: 6,
+        default_financial_fee_pct: 2.5,
+      }),
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('Auditoria P5.3 - HTTP API: Importação e Validação de Backup via POST /backup/import-json', async () => {
+  const app = express();
+  app.use('/api', apiRouter);
+  const server = app.listen(0);
+  const port = (server.address() as any).port;
+
+  try {
+    const payload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 3,
+      exported_at: '2026-10-18T14:00:00.000Z',
+      data: {
+        equipment: [],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    const res = await fetch(`http://127.0.0.1:${port}/api/backup/import-json?mode=preview&restoreMode=replace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as any;
+    assert.equal(body.valid, true);
+    assert.equal(body.errors.length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+

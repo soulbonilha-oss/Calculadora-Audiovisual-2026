@@ -9,7 +9,48 @@ if (!fs.existsSync(DB_DIR)) {
 
 export const DB_PATH = path.join(DB_DIR, 'fbonilha.sqlite');
 
+export const CANONICAL_SAMPLE_IDS = {
+  equipment: [
+    'eq_camera_fx3',
+    'eq_lens_2470',
+    'eq_light_300d',
+    'eq_audio_rode_pro',
+    'eq_gimbal_rs3',
+    'eq_tripod_manfrotto',
+  ],
+  recurring_expenses: [
+    'rec_internet',
+    'rec_accounting',
+    'rec_adobe',
+    'rec_cloud_storage',
+    'rec_studio_energy',
+    'rec_gear_insurance',
+  ],
+  expense_catalog: [
+    'cat_music',
+    'cat_hard_drive',
+    'cat_van_transport',
+    'cat_catering',
+    'cat_drone_permit',
+  ],
+  professionals: [
+    'pro_assistant',
+    'pro_audio',
+    'pro_drone',
+    'pro_colorist',
+    'pro_motion',
+  ],
+  production_templates: [
+    'tpl_social_reels',
+    'tpl_corporate_video',
+  ],
+} as const;
+
 let dbInstance: DatabaseSync | null = null;
+
+export function setDbInstance(db: DatabaseSync | null): void {
+  dbInstance = db;
+}
 
 export function getDb(): DatabaseSync {
   if (!dbInstance) {
@@ -22,7 +63,7 @@ export function getDb(): DatabaseSync {
   return dbInstance;
 }
 
-function runMigrations(db: DatabaseSync) {
+export function runMigrations(db: DatabaseSync) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version INTEGER PRIMARY KEY,
@@ -67,7 +108,7 @@ function runMigrations(db: DatabaseSync) {
       CREATE TABLE IF NOT EXISTS equipment (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        category TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT 'Geral',
         brand TEXT DEFAULT '',
         model TEXT DEFAULT '',
         serial_number TEXT DEFAULT '',
@@ -80,32 +121,34 @@ function runMigrations(db: DatabaseSync) {
         annual_hours REAL NOT NULL DEFAULT 600.0,
         notes TEXT DEFAULT '',
         is_active INTEGER NOT NULL DEFAULT 1,
+        is_sample INTEGER NOT NULL DEFAULT 0,
         is_deleted INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
       -- Custos Fixos Mensais (Rateio)
       CREATE TABLE IF NOT EXISTS recurring_expenses (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        category TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT 'Geral',
         monthly_value REAL NOT NULL DEFAULT 0.0,
         start_date TEXT DEFAULT '',
         end_date TEXT DEFAULT '',
         accounting_method TEXT NOT NULL DEFAULT 'overhead_allocated',
         notes TEXT DEFAULT '',
         is_active INTEGER NOT NULL DEFAULT 1,
+        is_sample INTEGER NOT NULL DEFAULT 0,
         is_deleted INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
       -- Catálogo de Despesas, Serviços e Materiais Extras
       CREATE TABLE IF NOT EXISTS expense_catalog (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        category TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT 'Geral',
         description TEXT DEFAULT '',
         cost_type TEXT NOT NULL DEFAULT 'per_project',
         default_value REAL NOT NULL DEFAULT 0.0,
@@ -113,25 +156,27 @@ function runMigrations(db: DatabaseSync) {
         accounting_method TEXT NOT NULL DEFAULT 'direct_project',
         notes TEXT DEFAULT '',
         is_active INTEGER NOT NULL DEFAULT 1,
+        is_sample INTEGER NOT NULL DEFAULT 0,
         is_deleted INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
       -- Profissionais e Terceirizados
       CREATE TABLE IF NOT EXISTS professionals (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        specialty TEXT NOT NULL,
+        specialty TEXT NOT NULL DEFAULT 'Geral',
         phone TEXT DEFAULT '',
         email TEXT DEFAULT '',
         hiring_type TEXT NOT NULL DEFAULT 'daily',
         default_value REAL NOT NULL DEFAULT 0.0,
         notes TEXT DEFAULT '',
         is_active INTEGER NOT NULL DEFAULT 1,
+        is_sample INTEGER NOT NULL DEFAULT 0,
         is_deleted INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
       -- Modelos Reutilizáveis de Produção
@@ -145,9 +190,10 @@ function runMigrations(db: DatabaseSync) {
         expenses_json TEXT NOT NULL DEFAULT '[]',
         pricing_config_json TEXT NOT NULL DEFAULT '{}',
         notes TEXT DEFAULT '',
+        is_sample INTEGER NOT NULL DEFAULT 0,
         is_deleted INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
       -- Orçamentos com Snapshots Imutáveis
@@ -172,8 +218,8 @@ function runMigrations(db: DatabaseSync) {
         pricing_config_json TEXT NOT NULL DEFAULT '{}',
         calculated_summary_json TEXT NOT NULL DEFAULT '{}',
         is_deleted INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
       -- Propostas Comerciais Emitidas
@@ -194,7 +240,7 @@ function runMigrations(db: DatabaseSync) {
         valid_until_date TEXT NOT NULL,
         issuer_contact_json TEXT NOT NULL DEFAULT '{}',
         commercial_terms TEXT DEFAULT '',
-        created_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (budget_id) REFERENCES budgets (id)
       );
     `);
@@ -242,35 +288,72 @@ function runMigrations(db: DatabaseSync) {
       }
     }
 
-    // Marcar registros iniciais com is_sample = 1
-    db.exec(`
-      UPDATE equipment SET is_sample = 1 WHERE id LIKE 'eq_%';
-      UPDATE recurring_expenses SET is_sample = 1 WHERE id LIKE 'rec_%';
-      UPDATE expense_catalog SET is_sample = 1 WHERE id LIKE 'cat_%';
-      UPDATE professionals SET is_sample = 1 WHERE id LIKE 'pro_%';
-      UPDATE production_templates SET is_sample = 1 WHERE id LIKE 'tpl_%';
-    `);
+    // Marcar exclusivamente registros canônicos oficiais com is_sample = 1 (nunca prefixos genéricos)
+    for (const [table, ids] of Object.entries(CANONICAL_SAMPLE_IDS)) {
+      const placeholders = ids.map(() => '?').join(', ');
+      db.prepare(`UPDATE ${table} SET is_sample = 1 WHERE id IN (${placeholders})`).run(...ids);
+    }
 
     db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, datetime(\'now\'))')
       .run(3, 'add_is_sample_flag_to_entities');
+  }
+
+  if (!appliedVersions.has(4)) {
+    // Migration 4: Proteção rigorosa de cadastros reais do usuário contra classificações errôneas por prefixo.
+    // NENHUM registro é classificado como demonstrativo exclusivamente pelo prefixo de ID.
+    // Cadastros reais criados pelo usuário (ex: eq_teste_real, pro_equipe, tpl_modelo) ou desconhecidos
+    // têm is_sample = 0. Apenas os IDs oficiais canônicos mantêm is_sample = 1.
+    for (const [table, ids] of Object.entries(CANONICAL_SAMPLE_IDS)) {
+      const placeholders = ids.map(() => '?').join(', ');
+      // 1. Zera is_sample para qualquer registro que NÃO esteja na lista canônica oficial
+      db.prepare(`UPDATE ${table} SET is_sample = 0 WHERE id NOT IN (${placeholders})`).run(...ids);
+      // 2. Garante is_sample = 1 exclusivamente para os IDs canônicos oficiais
+      db.prepare(`UPDATE ${table} SET is_sample = 1 WHERE id IN (${placeholders})`).run(...ids);
+    }
+
+    db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, datetime(\'now\'))')
+      .run(4, 'fix_sample_data_flag_and_protect_user_data');
   }
 }
 
 export function clearSampleData(db: DatabaseSync) {
   db.exec('BEGIN TRANSACTION;');
   try {
-    db.exec(`
-      DELETE FROM equipment WHERE is_sample = 1;
-      DELETE FROM recurring_expenses WHERE is_sample = 1;
-      DELETE FROM expense_catalog WHERE is_sample = 1;
-      DELETE FROM professionals WHERE is_sample = 1;
-      DELETE FROM production_templates WHERE is_sample = 1;
-    `);
+    for (const [table, ids] of Object.entries(CANONICAL_SAMPLE_IDS)) {
+      const placeholders = ids.map(() => '?').join(', ');
+      // Exclui SOMENTE registros canônicos demonstrativos comprovados
+      db.prepare(`DELETE FROM ${table} WHERE is_sample = 1 AND id IN (${placeholders})`).run(...ids);
+    }
     db.exec('COMMIT;');
   } catch (err) {
     db.exec('ROLLBACK;');
     throw err;
   }
+}
+
+export function listSampleData(db: DatabaseSync): Array<{ table: string; categoryLabel: string; id: string; name: string }> {
+  const result: Array<{ table: string; categoryLabel: string; id: string; name: string }> = [];
+  const tableLabels: Record<string, string> = {
+    equipment: 'Equipamento',
+    recurring_expenses: 'Custo Fixo',
+    expense_catalog: 'Catálogo de Despesas',
+    professionals: 'Equipe / Profissional',
+    production_templates: 'Modelo de Orçamento',
+  };
+
+  for (const [table, ids] of Object.entries(CANONICAL_SAMPLE_IDS)) {
+    const placeholders = ids.map(() => '?').join(', ');
+    const rows = db.prepare(`SELECT id, name FROM ${table} WHERE is_sample = 1 AND id IN (${placeholders})`).all(...ids) as any[];
+    for (const r of rows) {
+      result.push({
+        table,
+        categoryLabel: tableLabels[table] || table,
+        id: r.id,
+        name: r.name,
+      });
+    }
+  }
+  return result;
 }
 
 export function restoreSampleData(db: DatabaseSync) {
@@ -372,8 +455,8 @@ function seedInitialData(db: DatabaseSync) {
     INSERT OR IGNORE INTO equipment (
       id, name, category, brand, model, purchase_value, residual_value,
       useful_life_years, estimation_method, total_useful_hours, annual_hours,
-      notes, is_active, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      notes, is_active, is_sample, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
   `);
 
   for (const eq of initialEquipment) {
@@ -407,8 +490,8 @@ function seedInitialData(db: DatabaseSync) {
 
   const insertRec = db.prepare(`
     INSERT OR IGNORE INTO recurring_expenses (
-      id, name, category, monthly_value, accounting_method, is_active, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, 'overhead_allocated', 1, ?, ?)
+      id, name, category, monthly_value, accounting_method, is_active, is_sample, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'overhead_allocated', 1, 1, ?, ?)
   `);
 
   for (const rec of initialRecurring) {
@@ -426,8 +509,8 @@ function seedInitialData(db: DatabaseSync) {
 
   const insertCat = db.prepare(`
     INSERT OR IGNORE INTO expense_catalog (
-      id, name, category, cost_type, default_value, accounting_method, is_active, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 'direct_project', 1, ?, ?)
+      id, name, category, cost_type, default_value, accounting_method, is_active, is_sample, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'direct_project', 1, 1, ?, ?)
   `);
 
   for (const c of initialCatalog) {
@@ -445,8 +528,8 @@ function seedInitialData(db: DatabaseSync) {
 
   const insertPro = db.prepare(`
     INSERT OR IGNORE INTO professionals (
-      id, name, specialty, hiring_type, default_value, phone, is_active, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+      id, name, specialty, hiring_type, default_value, phone, is_active, is_sample, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
   `);
 
   for (const p of initialPros) {
@@ -536,8 +619,8 @@ function seedInitialData(db: DatabaseSync) {
   const insertTpl = db.prepare(`
     INSERT OR IGNORE INTO production_templates (
       id, name, description, stages_json, equipment_json, professionals_json,
-      expenses_json, pricing_config_json, is_deleted, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      expenses_json, pricing_config_json, is_deleted, is_sample, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
   `);
 
   for (const tpl of initialTemplates) {

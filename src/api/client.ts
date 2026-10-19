@@ -151,6 +151,10 @@ export const api = {
     fetch(`${BASE_URL}/proposals/${id}`).then((r) => handleResponse<ProposalSnapshot>(r)),
 
   // Gestão de Demonstração
+  listSampleData: () =>
+    fetch(`${BASE_URL}/demo/samples`).then((r) =>
+      handleResponse<{ samples: Array<{ table: string; categoryLabel: string; id: string; name: string }>; count: number }>(r)
+    ),
   clearSampleData: () =>
     fetch(`${BASE_URL}/demo/clear-samples`, { method: 'POST' }).then((r) => handleResponse<{ success: boolean; message: string }>(r)),
   restoreSampleData: () =>
@@ -159,8 +163,8 @@ export const api = {
   // Backup & Restauração
   exportBackupJsonUrl: () => `${BASE_URL}/backup/export-json`,
   exportBackupSqliteUrl: () => `${BASE_URL}/backup/export-sqlite`,
-  importBackupJson: (data: any, mode: 'preview' | 'commit' = 'preview') =>
-    fetch(`${BASE_URL}/backup/import-json?mode=${mode}`, {
+  importBackupJson: (data: any, mode: 'preview' | 'commit' = 'preview', restoreMode: 'replace' | 'merge' = 'replace') =>
+    fetch(`${BASE_URL}/backup/import-json?mode=${mode}&restoreMode=${restoreMode}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),

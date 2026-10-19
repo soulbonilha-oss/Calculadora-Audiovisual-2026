@@ -8,6 +8,10 @@ import {
   FileJson,
   Database,
   ShieldCheck,
+  Trash2,
+  Info,
+  X,
+  ShieldAlert,
 } from 'lucide-react';
 import { api } from '../../api/client';
 
@@ -18,9 +22,13 @@ interface BackupViewProps {
 export const BackupView: React.FC<BackupViewProps> = ({ onRefreshAllData }) => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewData, setPreviewData] = useState<any | null>(null);
+  const [restoreMode, setRestoreMode] = useState<'replace' | 'merge'>('replace');
   const [isProcessing, setIsProcessing] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [demoModalOpen, setDemoModalOpen] = useState(false);
+  const [demoItems, setDemoItems] = useState<Array<{ table: string; categoryLabel: string; id: string; name: string }>>([]);
+  const [loadingDemoItems, setLoadingDemoItems] = useState(false);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -37,7 +45,7 @@ export const BackupView: React.FC<BackupViewProps> = ({ onRefreshAllData }) => {
           const parsed = JSON.parse(content);
           // Fazer preview via backend
           setIsProcessing(true);
-          const previewResult = await api.importBackupJson(parsed, 'preview');
+          const previewResult = await api.importBackupJson(parsed, 'preview', restoreMode);
           setPreviewData({ ...previewResult, raw: parsed });
         } catch (err: any) {
           setErrorMessage(`Arquivo inválido: ${err.message}`);
@@ -49,47 +57,57 @@ export const BackupView: React.FC<BackupViewProps> = ({ onRefreshAllData }) => {
     }
   };
 
-  const handleClearDemoData = async () => {
-    if (confirm('Deseja remover todos os dados de demonstração (equipamentos, despesas e equipe pré-cadastrados como exemplo)? Seus orçamentos e cadastros próprios NÃO serão afetados.')) {
-      try {
-        setIsProcessing(true);
-        const res = await api.clearSampleData();
-        setFeedback(res.message);
-        await onRefreshAllData();
-      } catch (err: any) {
-        setErrorMessage(`Erro ao remover dados de exemplo: ${err.message}`);
-      } finally {
-        setIsProcessing(false);
-      }
+  const handleOpenClearDemoModal = async () => {
+    setLoadingDemoItems(true);
+    setDemoModalOpen(true);
+    try {
+      const res = await api.listSampleData();
+      setDemoItems(res.samples || []);
+    } catch (err: any) {
+      setErrorMessage(`Erro ao carregar lista de itens de demonstração: ${err.message}`);
+    } finally {
+      setLoadingDemoItems(false);
+    }
+  };
+
+  const handleConfirmClearDemo = async () => {
+    try {
+      setIsProcessing(true);
+      const res = await api.clearSampleData();
+      setFeedback(res.message);
+      setDemoModalOpen(false);
+      await onRefreshAllData();
+    } catch (err: any) {
+      setErrorMessage(`Erro ao remover dados de exemplo: ${err.message}`);
+    } finally {
+      setIsProcessing(false);
     }
   };
 
   const handleRestoreDemoData = async () => {
-    if (confirm('Deseja restaurar os modelos e equipamentos de demonstração da FBonilha?')) {
-      try {
-        setIsProcessing(true);
-        const res = await api.restoreSampleData();
-        setFeedback(res.message);
-        await onRefreshAllData();
-      } catch (err: any) {
-        setErrorMessage(`Erro ao restaurar dados de exemplo: ${err.message}`);
-      } finally {
-        setIsProcessing(false);
-      }
+    try {
+      setIsProcessing(true);
+      const res = await api.restoreSampleData();
+      setFeedback(res.message);
+      await onRefreshAllData();
+    } catch (err: any) {
+      setErrorMessage(`Erro ao restaurar dados de exemplo: ${err.message}`);
+    } finally {
+      setIsProcessing(false);
     }
   };
 
   const handleExecuteRestore = async () => {
     if (!previewData || !previewData.raw) return;
 
-    if (
-      confirm(
-        'ATENÇÃO: A restauração substituirá os registros atuais no banco de dados SQLite pelos dados contidos neste backup.\n\nUm backup de segurança automático será salvo antes da alteração.\n\nDeseja prosseguir com a restauração completa?'
-      )
-    ) {
+    const confirmationMessage = restoreMode === 'replace'
+      ? 'ATENÇÃO — SUBSTITUIÇÃO INTEGRAL DA BASE:\n\nOs dados atuais do SQLite serão substituídos exatamente pelos registros deste backup.\nQualquer cadastro ou orçamento atual que NÃO conste no arquivo será REMOVIDO.\n\nUm backup de segurança prévio será gerado automaticamente antes da operação.\n\nConfirma a substituição integral?'
+      : 'CONFIRMAÇÃO — MESCLAGEM DE DADOS:\n\nOs registros contidos neste backup serão inseridos e atualizados no banco atual.\nCadastros e orçamentos locais que não constem no arquivo serão preservados intactos.\n\nConfirma a mesclagem dos dados?';
+
+    if (confirm(confirmationMessage)) {
       try {
         setIsProcessing(true);
-        const res = await api.importBackupJson(previewData.raw, 'commit');
+        const res = await api.importBackupJson(previewData.raw, 'commit', restoreMode);
         setFeedback(res.message || 'Banco de dados e histórico de propostas restaurados com sucesso!');
         setPreviewData(null);
         setSelectedFile(null);
@@ -292,14 +310,74 @@ export const BackupView: React.FC<BackupViewProps> = ({ onRefreshAllData }) => {
               </div>
             </div>
 
+            {/* Seletor Explícito de Modalidade de Restauração */}
+            <div className="pt-2 border-t border-amber-200/60 space-y-2">
+              <label className="block text-xs font-bold text-amber-950 uppercase tracking-wider">
+                Modalidade de Restauração:
+              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div
+                  onClick={() => setRestoreMode('replace')}
+                  className={`p-3.5 rounded-lg border text-xs cursor-pointer transition-all ${
+                    restoreMode === 'replace'
+                      ? 'bg-red-50/80 border-red-300 ring-1 ring-red-400'
+                      : 'bg-white border-slate-200 hover:border-slate-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 font-bold text-slate-900">
+                    <input
+                      type="radio"
+                      name="restoreMode"
+                      checked={restoreMode === 'replace'}
+                      onChange={() => setRestoreMode('replace')}
+                      className="text-red-700"
+                    />
+                    <span>Modo A — Substituir a base</span>
+                  </div>
+                  <p className="text-[11px] text-slate-600 mt-1 pl-5">
+                    O banco corresponderá exatamente ao backup. Registros atuais não presentes no arquivo serão removidos. Ideal para recuperação de estado exato.
+                  </p>
+                </div>
+
+                <div
+                  onClick={() => setRestoreMode('merge')}
+                  className={`p-3.5 rounded-lg border text-xs cursor-pointer transition-all ${
+                    restoreMode === 'merge'
+                      ? 'bg-emerald-50/80 border-emerald-300 ring-1 ring-emerald-400'
+                      : 'bg-white border-slate-200 hover:border-slate-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 font-bold text-slate-900">
+                    <input
+                      type="radio"
+                      name="restoreMode"
+                      checked={restoreMode === 'merge'}
+                      onChange={() => setRestoreMode('merge')}
+                      className="text-emerald-700"
+                    />
+                    <span>Modo B — Mesclar dados</span>
+                  </div>
+                  <p className="text-[11px] text-slate-600 mt-1 pl-5">
+                    Insere novos e atualiza registros existentes pelo ID. Registros atuais que não constem no backup são preservados intactos.
+                  </p>
+                </div>
+              </div>
+            </div>
+
             <div className="pt-2 flex justify-end">
               <button
                 type="button"
                 onClick={handleExecuteRestore}
                 disabled={isProcessing || !previewData.valid}
-                className="px-5 py-2 text-xs font-semibold text-white bg-red-700 rounded-lg hover:bg-red-800 disabled:opacity-50 transition-colors shadow-xs"
+                className={`px-5 py-2 text-xs font-semibold text-white rounded-lg disabled:opacity-50 transition-colors shadow-xs ${
+                  restoreMode === 'replace' ? 'bg-red-700 hover:bg-red-800' : 'bg-emerald-700 hover:bg-emerald-800'
+                }`}
               >
-                {isProcessing ? 'Restaurando...' : 'Confirmar e Restaurar Banco de Dados'}
+                {isProcessing
+                  ? 'Restaurando...'
+                  : restoreMode === 'replace'
+                  ? 'Confirmar e Substituir Base Completa'
+                  : 'Confirmar e Mesclar Dados'}
               </button>
             </div>
           </div>
@@ -330,7 +408,7 @@ export const BackupView: React.FC<BackupViewProps> = ({ onRefreshAllData }) => {
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={handleClearDemoData}
+              onClick={handleOpenClearDemoModal}
               disabled={isProcessing}
               className="px-3.5 py-1.5 text-xs font-semibold text-red-700 bg-white border border-red-200 rounded-lg hover:bg-red-50 transition-colors shadow-xs"
             >
@@ -358,6 +436,88 @@ export const BackupView: React.FC<BackupViewProps> = ({ onRefreshAllData }) => {
           <li>Antes de cada restauração, o sistema gera automaticamente uma cópia de segurança prévia na pasta <code>data/</code>.</li>
         </ul>
       </div>
+
+      {/* Modal de Confirmação com Listagem de Registros Demonstrativos */}
+      {demoModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+          <div className="bg-white rounded-2xl max-w-xl w-full p-6 space-y-4 shadow-xl border border-slate-200 animate-in fade-in zoom-in duration-150">
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-2 text-red-700 font-bold text-base">
+                <Trash2 className="w-5 h-5 text-red-600" />
+                <span>Remoção de Dados Demonstrativos</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDemoModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 p-1 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Esta operação removerá <strong>exclusivamente</strong> os cadastros de modelo e demonstração oficiais pré-instalados na aplicação, permitindo que você comece com uma base 100% personalizada.
+            </p>
+
+            <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-900 flex items-start gap-2.5">
+              <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-bold">Proteção Rigorosa dos Seus Dados:</p>
+                <p className="text-[11px] text-emerald-800 mt-0.5">
+                  Seus orçamentos salvos, propostas comerciais já emitidas e todos os cadastros criados por você (mesmo com prefixos padrão) <strong>não serão afetados</strong> e permanecerão preservados.
+                </p>
+              </div>
+            </div>
+
+            {loadingDemoItems ? (
+              <div className="p-8 text-center text-xs text-slate-500">
+                Identificando itens de demonstração na base...
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <p className="text-[11px] font-bold text-slate-700 uppercase tracking-wider">
+                  Itens canônicos que serão removidos ({demoItems.length}):
+                </p>
+                <div className="max-h-48 overflow-y-auto border border-slate-200 rounded-xl p-2 divide-y divide-slate-100 text-xs">
+                  {demoItems.length === 0 ? (
+                    <div className="p-4 text-center text-slate-400 text-xs">
+                      Nenhum registro demonstrativo ativo encontrado na base.
+                    </div>
+                  ) : (
+                    demoItems.map((item) => (
+                      <div key={item.id} className="py-1.5 px-2 flex items-center justify-between">
+                        <span className="font-medium text-slate-800 truncate mr-2">{item.name}</span>
+                        <span className="shrink-0 px-2 py-0.5 text-[10px] rounded bg-slate-100 text-slate-600 font-semibold">
+                          {item.categoryLabel}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div className="pt-2 flex items-center justify-end gap-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setDemoModalOpen(false)}
+                disabled={isProcessing}
+                className="px-4 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors shadow-xs"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmClearDemo}
+                disabled={isProcessing || loadingDemoItems || demoItems.length === 0}
+                className="px-4 py-2 text-xs font-semibold text-white bg-red-700 hover:bg-red-800 rounded-lg disabled:opacity-50 transition-colors shadow-xs"
+              >
+                {isProcessing ? 'Removendo...' : 'Confirmar e Limpar Dados Demonstrativos'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

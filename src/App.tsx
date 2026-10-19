@@ -114,15 +114,15 @@ export default function App() {
       professionals: [],
       expenses: [],
       pricingConfig: {
-        method: settings?.default_pricing_method || 'margin_on_sale',
-        desiredProfitMarginPct: settings?.default_profit_margin_pct || 25,
-        desiredMarkupPct: settings?.default_markup_pct || 35,
-        taxPct: settings?.default_tax_pct || 6,
-        financialFeePct: settings?.default_financial_fee_pct || 2.5,
-        fixedTransactionFee: settings?.default_fixed_fee || 0,
+        method: settings?.default_pricing_method ?? 'margin_on_sale',
+        desiredProfitMarginPct: settings?.default_profit_margin_pct ?? 25,
+        desiredMarkupPct: settings?.default_markup_pct ?? 35,
+        taxPct: settings?.default_tax_pct ?? 6,
+        financialFeePct: settings?.default_financial_fee_pct ?? 2.5,
+        fixedTransactionFee: settings?.default_fixed_fee ?? 0,
         customPriceOverride: null,
-        cashDiscountPct: settings?.default_cash_discount_pct || 10,
-        installmentCount: settings?.default_installments || 4,
+        cashDiscountPct: settings?.default_cash_discount_pct ?? 10,
+        installmentCount: settings?.default_installments ?? 4,
       },
     });
     setActiveView('budget_editor');
