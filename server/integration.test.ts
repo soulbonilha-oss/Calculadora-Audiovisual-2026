@@ -15,9 +15,10 @@ import {
   parseAndValidateImportMode,
   setSafetyBackupDir,
   getSafetyBackupDir,
+  getRawSafetyBackupDir,
   SUPPORTED_SCHEMA_VERSIONS,
 } from './api.js';
-import { setDbInstance, runMigrations, clearSampleData, restoreSampleData, CANONICAL_SAMPLE_IDS } from './db.js';
+import { setDbInstance, getDbInstance, runMigrations, clearSampleData, restoreSampleData, CANONICAL_SAMPLE_IDS } from './db.js';
 import { generateCommercialProposalPdf } from '../src/utils/pdfGenerator.js';
 import { calculateProjectPricing } from '../src/financial/engine.js';
 
@@ -1218,4 +1219,295 @@ test('RC3.2 - schema_version: rejeita números fracionários, NaN, strings, zero
   assert.equal(repFuture99.isValid, false);
   assert.match(repFuture99.errors[0], /não suportada por esta versão da aplicação/i);
 });
+
+// ============================================================================
+// RODADA COMPLEMENTAR 4: ISOLAMENTO TOTAL SEM DEPENDÊNCIA DE NODE_ENV E PROTEÇÃO DE MERGE
+// ============================================================================
+
+test('RC4.1 - O isolamento continua funcionando quando NODE_ENV não está definido', async () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  delete process.env.NODE_ENV;
+
+  try {
+    const permanentBackupDir = path.resolve(process.cwd(), 'data', 'backups');
+    const filesBefore = fs.existsSync(permanentBackupDir) ? fs.readdirSync(permanentBackupDir) : [];
+
+    await withTestServer(async ({ baseUrl, db, backupDir }) => {
+      // 1. Mesmo sem NODE_ENV definido, withTestServer fornece db e backupDir isolados
+      assert.ok(backupDir.includes('safety_test_backups_'), 'Backup dir deve ser temporário');
+
+      const payload = {
+        app: 'FBonilha.mov',
+        version: '2.0.0',
+        schema_version: 4,
+        data: {
+          settings: { studio_name: 'Studio Sem NodeEnv' },
+          equipment: [{ id: 'eq_no_env', name: 'Microfone Boom', purchase_value: 3000 }],
+          recurring_expenses: [],
+          expense_catalog: [],
+          professionals: [],
+          production_templates: [],
+          budgets: [],
+          proposals: [],
+        },
+      };
+
+      const res = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=replace`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(res.status, 200);
+
+      // Backup de segurança gravado apenas em backupDir temporário
+      const testFiles = fs.readdirSync(backupDir).filter((f) => f.startsWith('safety_pre_restore_'));
+      assert.ok(testFiles.length >= 1, 'Backup deve existir no diretório temporário');
+
+      // data/backups permanece intocado
+      const filesAfter = fs.existsSync(permanentBackupDir) ? fs.readdirSync(permanentBackupDir) : [];
+      assert.deepEqual(filesAfter.sort(), filesBefore.sort(), 'data/backups não deve ser modificado');
+    });
+  } finally {
+    process.env.NODE_ENV = originalNodeEnv;
+  }
+});
+
+test('RC4.2 - A limpeza remove os arquivos temporários mesmo quando uma operação/teste falha', async () => {
+  let capturedDbPath = '';
+  let capturedBackupDir = '';
+
+  await assert.rejects(
+    async () => {
+      await withTestServer(async ({ dbPath, backupDir, db }) => {
+        capturedDbPath = dbPath;
+        capturedBackupDir = backupDir;
+
+        // Gera arquivo de backup no diretório temporário
+        createSafetyBackup(db, backupDir);
+        assert.ok(fs.readdirSync(backupDir).length > 0, 'Arquivo gerado no diretório temporário');
+
+        // Simula falha catastrófica no teste
+        throw new Error('Falha simulada para verificar limpeza de recursos');
+      });
+    },
+    (err: any) => {
+      assert.match(err.message, /Falha simulada para verificar limpeza de recursos/);
+      return true;
+    }
+  );
+
+  // Comprova que todos os artefatos temporários foram expurgados pelo finally de withTestServer
+  assert.equal(fs.existsSync(capturedDbPath), false, 'Arquivo sqlite deve ter sido excluído');
+  assert.equal(fs.existsSync(`${capturedDbPath}-wal`), false, 'Arquivo sqlite-wal deve ter sido excluído');
+  assert.equal(fs.existsSync(`${capturedDbPath}-shm`), false, 'Arquivo sqlite-shm deve ter sido excluído');
+  assert.equal(fs.existsSync(capturedBackupDir), false, 'Diretório temporário de backups deve ter sido removido');
+});
+
+test('RC4.3 - Modo merge: backup preventivo de segurança é gerado e validado antes da primeira alteração em modo commit', async () => {
+  await withTestServer(async ({ baseUrl, db, backupDir }) => {
+    // 1. Estado inicial do banco
+    db.prepare('UPDATE settings SET studio_name = ? WHERE id = 1').run('Studio Original');
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)')
+      .run('eq_original_1', 'Câmera Original', 12000, 1200);
+
+    const payload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Mesclado' },
+        equipment: [{ id: 'eq_novo_2', name: 'Lente 50mm Nova', purchase_value: 4000, residual_value: 400 }],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    // 2. Executa restauração commit no modo merge
+    const res = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=merge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(res.status, 200);
+
+    // 3. Comprova que o backup preventivo foi criado no diretório temporário
+    const backupFiles = fs.readdirSync(backupDir).filter((f) => f.startsWith('safety_pre_restore_'));
+    assert.equal(backupFiles.length, 1, 'Exatamente 1 backup preventivo deve ser criado para a operação merge');
+
+    const backupFilePath = path.join(backupDir, backupFiles[0]);
+    assert.ok(fs.statSync(backupFilePath).size > 0, 'Backup preventivo deve ter tamanho > 0');
+
+    // 4. Valida a integridade do snapshot do backup e comprova que continha o estado ANTERIOR à mesclagem
+    const snapshotDb = new DatabaseSync(backupFilePath);
+    const integrity = (snapshotDb.prepare('PRAGMA integrity_check').get() as any).integrity_check;
+    assert.equal(integrity, 'ok', 'Snapshot de segurança deve ser íntegro');
+
+    const snapshotSettings = (snapshotDb.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any).studio_name;
+    assert.equal(snapshotSettings, 'Studio Original', 'Snapshot deve conter estado anterior da configuração');
+
+    const snapshotEqOriginal = snapshotDb.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_original_1') as any;
+    assert.ok(snapshotEqOriginal, 'Snapshot deve conter equipamento pré-existente');
+
+    const snapshotEqNew = snapshotDb.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_novo_2');
+    assert.equal(snapshotEqNew, undefined, 'Snapshot gerado antes da escrita NÃO deve conter novo equipamento');
+    snapshotDb.close();
+
+    // 5. No banco atual pós-merge: ambos os equipamentos coexistem e settings foi atualizado
+    const currentSettings = (db.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any).studio_name;
+    assert.equal(currentSettings, 'Studio Mesclado');
+
+    const currentEqOriginal = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_original_1') as any;
+    assert.ok(currentEqOriginal, 'Item original foi preservado no modo merge');
+
+    const currentEqNew = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_novo_2') as any;
+    assert.ok(currentEqNew, 'Novo item foi inserido no modo merge');
+  });
+});
+
+test('RC4.4 - Modo merge: falha na criação do backup preventivo aborta restauração e nenhuma configuração ou registro é alterado', async () => {
+  await withTestServer(async ({ baseUrl, db, backupDir }) => {
+    // 1. Estado inicial protegido
+    db.prepare('UPDATE settings SET studio_name = ? WHERE id = 1').run('Studio Seguro Merge');
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)')
+      .run('eq_seguro_1', 'Equipamento Intacto', 8000, 800);
+
+    // 2. Aponta temporariamente o diretório de backup de segurança para um arquivo regular (impossibilitando mkdir / escrita)
+    const blockerFile = path.resolve(backupDir, 'blocker_file_not_dir');
+    fs.writeFileSync(blockerFile, 'not-a-directory');
+    setSafetyBackupDir(blockerFile);
+
+    const payload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Invadido Tentativa' },
+        equipment: [{ id: 'eq_invasor', name: 'Item Invasor Nao Permitido', purchase_value: 99999 }],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [],
+        proposals: [],
+      },
+    };
+
+    try {
+      const res = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=merge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(res.status, 500);
+      const resBody = (await res.json()) as any;
+      assert.match(resBody.error, /Falha de segurança preventiva/);
+
+      // 3. Comprova que NENHUMA alteração foi feita no banco
+      const settings = (db.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any).studio_name;
+      assert.equal(settings, 'Studio Seguro Merge', 'Configuração não pode ter sido alterada');
+
+      const originalEq = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_seguro_1') as any;
+      assert.ok(originalEq, 'Registro pré-existente deve permanecer intacto');
+      assert.equal(originalEq.name, 'Equipamento Intacto');
+
+      const invader = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_invasor');
+      assert.equal(invader, undefined, 'Registro invasor não pode ter sido inserido');
+    } finally {
+      setSafetyBackupDir(backupDir);
+    }
+  });
+});
+
+test('RC4.5 - Modo merge: rollback transacional reverte alterações se ocorrer erro durante a mesclagem', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    // 1. Estado inicial
+    db.prepare('UPDATE settings SET studio_name = ? WHERE id = 1').run('Studio Original Rollback');
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)')
+      .run('eq_rb_1', 'Câmera Rollback 1', 6000, 600);
+
+    // Cria um trigger temporário para forçar falha no meio da transação de inserção em budgets
+    db.exec(`
+      CREATE TRIGGER fail_on_budgets_trigger
+      BEFORE INSERT ON budgets
+      BEGIN
+        SELECT RAISE(ABORT, 'Simulated SQLite Transaction Failure on Budgets');
+      END;
+    `);
+
+    // Payload estruturalmente válido para passar no validateBackupPayload
+    const validStructurePayload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Nome Alterado Que Deve Sofrer Rollback' },
+        equipment: [{ id: 'eq_rb_novo', name: 'Lente Nova Que Deve Sofrer Rollback', purchase_value: 3000 }],
+        recurring_expenses: [],
+        expense_catalog: [],
+        professionals: [],
+        production_templates: [],
+        budgets: [{ id: 'bud_trigger_fail', code: 'ORC-FAIL', title: 'Orcamento Falha', client_name: 'Cliente Teste' }],
+        proposals: [],
+      },
+    };
+
+    try {
+      const res = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=merge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(validStructurePayload),
+      });
+      assert.equal(res.status, 500);
+
+      // Comprova o rollback atômico:
+      const settings = (db.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any).studio_name;
+      assert.equal(settings, 'Studio Original Rollback', 'Settings deve ter sofrido rollback para o valor original');
+
+      const eqOriginal = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_rb_1') as any;
+      assert.ok(eqOriginal, 'Equipamento original permanece intacto');
+
+      const eqNovo = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_rb_novo');
+      assert.equal(eqNovo, undefined, 'Equipamento inserido antes da falha deve ter sido revertido pelo rollback');
+    } finally {
+      db.exec('DROP TRIGGER IF EXISTS fail_on_budgets_trigger;');
+    }
+  });
+});
+
+test('RC4.6 - Modo merge: validação prévia integral rejeita payload malformado com 400 antes de alterar qualquer registro', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    db.prepare('UPDATE settings SET studio_name = ? WHERE id = 1').run('Studio Intacto Validacao');
+    db.prepare('INSERT INTO equipment (id, name, purchase_value, residual_value) VALUES (?, ?, ?, ?)')
+      .run('eq_val_1', 'Câmera Intacta Val', 5000, 500);
+
+    const brokenPayload = {
+      app: 'FBonilha.mov',
+      version: '2.0.0',
+      schema_version: 4,
+      data: {
+        settings: { studio_name: 'Studio Nao Deve Mudar' },
+        equipment: [{ id: 'eq_invalido', purchase_value: -999 }], // Inválido: sem name e purchase_value negativo
+      },
+    };
+
+    const res = await fetch(`${baseUrl}/backup/import-json?mode=commit&restoreMode=merge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(brokenPayload),
+    });
+    assert.equal(res.status, 400);
+
+    const settings = (db.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any).studio_name;
+    assert.equal(settings, 'Studio Intacto Validacao');
+
+    const eq = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq_val_1') as any;
+    assert.ok(eq);
+    assert.equal(eq.name, 'Câmera Intacta Val');
+  });
+});
+
 

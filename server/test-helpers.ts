@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import express from 'express';
-import { apiRouter, setSafetyBackupDir } from './api.js';
-import { setDbInstance, runMigrations } from './db.js';
+import { apiRouter, setSafetyBackupDir, getRawSafetyBackupDir } from './api.js';
+import { setDbInstance, getDbInstance, runMigrations } from './db.js';
 
 export interface TestServerContext {
   baseUrl: string;
@@ -18,11 +18,14 @@ export interface TestServerContext {
  * Cria um banco temporário único por execução de teste em /tmp, executa migrações,
  * vincula a instância via setDbInstance, isola backups de segurança em diretório temporário exclusivo
  * e garante limpeza integral de conexões e arquivos (incluindo WAL, SHM e backups de segurança),
- * mesmo que o teste falhe com exceção.
+ * restaurando fielmente o estado global anterior ao finalizar, mesmo que o teste falhe com exceção.
  */
 export async function withTestServer(
   testFn: (ctx: TestServerContext) => Promise<void>
 ): Promise<void> {
+  const prevDb = getDbInstance();
+  const prevSafetyDir = getRawSafetyBackupDir();
+
   const dbPath = path.resolve('/tmp', `test_${crypto.randomUUID()}.sqlite`);
   const db = new DatabaseSync(dbPath);
   db.exec('PRAGMA journal_mode = WAL;');
@@ -54,8 +57,8 @@ export async function withTestServer(
       await new Promise<void>((resolve) => server.close(() => resolve()));
     } catch {}
 
-    setDbInstance(null);
-    setSafetyBackupDir(null);
+    setDbInstance(prevDb);
+    setSafetyBackupDir(prevSafetyDir);
 
     try {
       db.close();

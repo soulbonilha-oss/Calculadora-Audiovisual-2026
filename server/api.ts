@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { getDb, DB_PATH, clearSampleData, restoreSampleData, listSampleData } from './db.js';
+import { getDb, DB_PATH, clearSampleData, restoreSampleData, listSampleData, isTestEnvironment } from './db.js';
 import {
   calculateEquipmentDepreciation,
   calculateOwnLabor,
@@ -1200,6 +1200,10 @@ export function setSafetyBackupDir(dir: string | null): void {
   defaultSafetyBackupDir = dir;
 }
 
+export function getRawSafetyBackupDir(): string | null {
+  return defaultSafetyBackupDir;
+}
+
 export function getSafetyBackupDir(): string {
   if (defaultSafetyBackupDir) {
     return defaultSafetyBackupDir;
@@ -1207,7 +1211,7 @@ export function getSafetyBackupDir(): string {
   if (process.env.SAFETY_BACKUP_DIR) {
     return process.env.SAFETY_BACKUP_DIR;
   }
-  if (process.env.NODE_ENV === 'test') {
+  if (isTestEnvironment()) {
     throw new Error(
       '[TEST GUARD] Tentativa não autorizada de criar backup de segurança no diretório persistente do projeto (data/backups) em ambiente de teste. Os testes devem utilizar um diretório temporário isolado via withTestServer() ou setSafetyBackupDir().'
     );
@@ -1602,25 +1606,23 @@ export function restoreBackupData(
   }
 
   // 2. Proteção de isolamento de teste: nunca modificar banco de produção em ambiente de teste
-  if (process.env.NODE_ENV === 'test' && (db as any).__isPersistentProductionDb) {
+  if (isTestEnvironment() && (db as any).__isPersistentProductionDb) {
     throw new Error('[TEST GUARD] Operação destrutiva bloqueada: restoreBackupData não pode ser executada contra o banco persistente real em ambiente de teste.');
   }
 
-  // 3. Backup preventivo de segurança obrigatório antes de restauração destrutiva (modo replace)
-  if (restoreMode === 'replace') {
-    if (options.skipSafetyBackup && (db as any).__isPersistentProductionDb) {
-      throw new Error('O backup de segurança é estritamente obrigatório para o banco de dados persistente de produção e não pode ser ignorado.');
-    }
+  // 3. Backup preventivo de segurança obrigatório antes de restauração commit (tanto em modo replace quanto em merge)
+  if (options.skipSafetyBackup && (db as any).__isPersistentProductionDb) {
+    throw new Error('O backup de segurança é estritamente obrigatório para o banco de dados persistente de produção e não pode ser ignorado.');
+  }
 
-    if (!options.skipSafetyBackup) {
-      try {
-        createSafetyBackup(db, options.safetyBackupDir);
-      } catch (backupErr: any) {
-        console.error('[RESTORE SAFETY BACKUP FAILED]', backupErr);
-        throw new Error(
-          `Falha de segurança preventiva: não foi possível criar o backup de segurança obrigatório antes da restauração. A restauração foi cancelada e nenhum dado foi alterado.`
-        );
-      }
+  if (!options.skipSafetyBackup) {
+    try {
+      createSafetyBackup(db, options.safetyBackupDir);
+    } catch (backupErr: any) {
+      console.error('[RESTORE SAFETY BACKUP FAILED]', backupErr);
+      throw new Error(
+        `Falha de segurança preventiva: não foi possível criar o backup de segurança obrigatório antes da restauração. A restauração foi cancelada e nenhum dado foi alterado.`
+      );
     }
   }
 
@@ -1973,9 +1975,7 @@ apiRouter.get('/backup/export-sqlite', (req: Request, res: Response) => {
 
 apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
   try {
-    const db = getDb();
-    const payload = req.body?.payload ? req.body.payload : req.body;
-
+    // 1. Validação estrita de mode e restoreMode ANTES de acessar ou inicializar o banco
     let mode: 'preview' | 'commit';
     try {
       mode = parseAndValidateImportMode(req.query.mode, req.body?.mode);
@@ -1989,6 +1989,9 @@ apiRouter.post('/backup/import-json', (req: Request, res: Response) => {
     } catch (restoreModeErr: any) {
       return res.status(400).json({ error: restoreModeErr.message });
     }
+
+    const db = getDb();
+    const payload = req.body?.payload ? req.body.payload : req.body;
 
     const validation = validateBackupPayload(payload, db, { restoreMode });
 

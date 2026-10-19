@@ -47,14 +47,36 @@ export const CANONICAL_SAMPLE_IDS = {
 } as const;
 
 let dbInstance: DatabaseSync | null = null;
+let explicitTestMode: boolean | null = null;
+
+export function setTestMode(active: boolean | null): void {
+  explicitTestMode = active;
+}
+
+export function isTestEnvironment(): boolean {
+  if (explicitTestMode !== null) {
+    return explicitTestMode;
+  }
+  return (
+    process.env.NODE_ENV === 'test' ||
+    Boolean(process.env.NODE_TEST_CONTEXT) ||
+    process.execArgv.includes('--test') ||
+    process.argv.includes('--test') ||
+    process.argv.some((arg) => arg.includes('.test.ts') || arg.includes('.spec.ts'))
+  );
+}
 
 export function setDbInstance(db: DatabaseSync | null): void {
   dbInstance = db;
 }
 
+export function getDbInstance(): DatabaseSync | null {
+  return dbInstance;
+}
+
 export function getDb(): DatabaseSync {
   if (!dbInstance) {
-    if (process.env.NODE_ENV === 'test') {
+    if (isTestEnvironment()) {
       throw new Error(
         '[TEST GUARD] Tentativa não autorizada de acessar o banco de dados persistente real (DB_PATH) em ambiente de teste. Todo teste deve utilizar uma instância isolada com withTestServer() ou setDbInstance().'
       );
@@ -323,7 +345,7 @@ export function runMigrations(db: DatabaseSync) {
 }
 
 export function clearSampleData(db: DatabaseSync) {
-  if (process.env.NODE_ENV === 'test' && (db as any).__isPersistentProductionDb) {
+  if (isTestEnvironment() && (db as any).__isPersistentProductionDb) {
     throw new Error('[TEST GUARD] Operação destrutiva bloqueada: clearSampleData não pode ser executada contra o banco persistente real em ambiente de teste.');
   }
   db.exec('BEGIN TRANSACTION;');
