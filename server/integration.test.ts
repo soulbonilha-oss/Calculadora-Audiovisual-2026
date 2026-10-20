@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import http from 'node:http';
 import express from 'express';
 import {
   apiRouter,
@@ -1666,12 +1667,36 @@ test('RC5.4 - withTestServer restaura estado global anterior quando a função d
 test('RC5.5 - Falha durante a preparação do servidor não deixa recursos temporários ou referências globais abandonadas', async () => {
   const sentinelDb = new DatabaseSync(':memory:');
   const sentinelSafetyDir = '/tmp/sentinel_prep_fail';
+  const sentinelTestMode = false;
   setDbInstance(sentinelDb);
   setSafetyBackupDir(sentinelSafetyDir);
+  setTestMode(sentinelTestMode);
+
+  // Arquivos e diretórios preexistentes que devem ser rigorosamente preservados
+  const preexistingFile = path.resolve('/tmp', `preexisting_prep_fail_${crypto.randomUUID()}.txt`);
+  const preexistingDir = path.resolve('/tmp', `preexisting_prep_dir_${crypto.randomUUID()}`);
+  fs.writeFileSync(preexistingFile, 'conteúdo preexistente que não deve ser removido');
+  fs.mkdirSync(preexistingDir, { recursive: true });
+  const preexistingNestedFile = path.resolve(preexistingDir, 'nested.txt');
+  fs.writeFileSync(preexistingNestedFile, 'conteúdo aninhado');
+
+  let capturedDbPath: string | null = null;
+  let capturedBackupDir: string | null = null;
 
   const originalListen = express.application.listen;
-  // Intercepta app.listen para disparar erro durante a inicialização do Express
+  // Intercepta app.listen para capturar os recursos exclusivos do helper antes de simular o erro
   (express.application as any).listen = function () {
+    const currentDb = getDbInstance();
+    if (currentDb) {
+      const list = currentDb.prepare('PRAGMA database_list').all() as any[];
+      capturedDbPath = list.find((d: any) => d.name === 'main')?.file || null;
+    }
+    capturedBackupDir = getRawSafetyBackupDir();
+
+    // Valida que os recursos temporários foram de fato criados antes da falha
+    assert.ok(capturedDbPath && fs.existsSync(capturedDbPath), 'Arquivo SQLite temporário deve existir antes da falha no listen');
+    assert.ok(capturedBackupDir && fs.existsSync(capturedBackupDir), 'Diretório temporário de backups deve existir antes da falha no listen');
+
     throw new Error('Falha simulada na inicialização do servidor HTTP');
   };
 
@@ -1683,14 +1708,39 @@ test('RC5.5 - Falha durante a preparação do servidor não deixa recursos tempo
       (err: any) => err.message === 'Falha simulada na inicialização do servidor HTTP'
     );
 
-    // O estado global DEVE ter sido restaurado para o sentinela prévio
+    // 1. Arquivo SQLite temporário exclusivo do helper deve ter sido removido
+    assert.ok(capturedDbPath, 'Caminho do banco temporário deve ter sido capturado');
+    assert.equal(fs.existsSync(capturedDbPath!), false, 'Arquivo SQLite temporário deve ter sido removido');
+
+    // 2. Arquivos -wal e -shm temporários não devem existir
+    assert.equal(fs.existsSync(`${capturedDbPath}-wal`), false, 'Arquivo -wal temporário não deve existir');
+    assert.equal(fs.existsSync(`${capturedDbPath}-shm`), false, 'Arquivo -shm temporário não deve existir');
+
+    // 3. Diretório temporário de backups exclusivo do helper deve ter sido removido
+    assert.ok(capturedBackupDir, 'Caminho do backupDir temporário deve ter sido capturado');
+    assert.equal(fs.existsSync(capturedBackupDir!), false, 'Diretório temporário de backups deve ter sido removido');
+
+    // 4. Restauração integral de dbInstance, safetyBackupDir e testMode
     assert.equal(getDbInstance(), sentinelDb, 'dbInstance restaurado após falha na preparação');
     assert.equal(getRawSafetyBackupDir(), sentinelSafetyDir, 'safetyBackupDir restaurado após falha na preparação');
+    assert.equal(getTestMode(), sentinelTestMode, 'testMode restaurado após falha na preparação');
+
+    // 5. Banco sentinela permanece aberto e operacional
+    const check = sentinelDb.prepare('SELECT 99 as val').get() as any;
+    assert.equal(check.val, 99, 'Banco sentinela deve permanecer aberto e operacional');
+
+    // 6. Arquivos e diretórios preexistentes são rigorosamente preservados
+    assert.ok(fs.existsSync(preexistingFile), 'Arquivo preexistente deve ser preservado');
+    assert.ok(fs.existsSync(preexistingDir), 'Diretório preexistente deve ser preservado');
+    assert.ok(fs.existsSync(preexistingNestedFile), 'Arquivo dentro do diretório preexistente deve ser preservado');
   } finally {
     (express.application as any).listen = originalListen;
     sentinelDb.close();
     setDbInstance(null);
     setSafetyBackupDir(null);
+    setTestMode(null);
+    if (fs.existsSync(preexistingFile)) fs.unlinkSync(preexistingFile);
+    if (fs.existsSync(preexistingDir)) fs.rmSync(preexistingDir, { recursive: true, force: true });
   }
 });
 
@@ -1724,13 +1774,28 @@ test('RC5.6 - Serialização de withTestServer via mutex impede race conditions 
 test('RC5.7 - Falha durante a execução de migrações na preparação de withTestServer restaura estado global e não deixa arquivos temporários', async () => {
   const sentinelDb = new DatabaseSync(':memory:');
   const sentinelSafetyDir = '/tmp/sentinel_migration_fail';
+  const sentinelTestMode = true;
   setDbInstance(sentinelDb);
   setSafetyBackupDir(sentinelSafetyDir);
+  setTestMode(sentinelTestMode);
+
+  // Arquivos e diretórios preexistentes que devem ser preservados
+  const preexistingFile = path.resolve('/tmp', `preexisting_migration_${crypto.randomUUID()}.txt`);
+  const preexistingDir = path.resolve('/tmp', `preexisting_dir_mig_${crypto.randomUUID()}`);
+  fs.writeFileSync(preexistingFile, 'arquivo preexistente que deve ser intocado');
+  fs.mkdirSync(preexistingDir, { recursive: true });
+  const preexistingNestedFile = path.resolve(preexistingDir, 'inner.txt');
+  fs.writeFileSync(preexistingNestedFile, 'conteúdo interno');
+
+  let capturedDbPath: string | null = null;
 
   const origExec = DatabaseSync.prototype.exec;
   // Intercepta exec para simular falha catastrófica durante as migrações iniciais do banco
   DatabaseSync.prototype.exec = function (sql: string) {
     if (typeof sql === 'string' && sql.includes('CREATE TABLE IF NOT EXISTS settings')) {
+      const list = (this as any).prepare('PRAGMA database_list').all() as any[];
+      capturedDbPath = list.find((d: any) => d.name === 'main')?.file || null;
+      assert.ok(capturedDbPath && fs.existsSync(capturedDbPath), 'Arquivo SQLite deve existir antes do aborto de migrações');
       throw new Error('Falha simulada na execução das migrações do SQLite');
     }
     return origExec.apply(this, arguments as any);
@@ -1744,14 +1809,39 @@ test('RC5.7 - Falha durante a execução de migrações na preparação de withT
       (err: any) => err.message === 'Falha simulada na execução das migrações do SQLite'
     );
 
-    // O estado global DEVE ter sido restaurado para o sentinela prévio
+    // 1. Arquivo SQLite temporário criado na preparação foi removido
+    assert.ok(capturedDbPath, 'Caminho do banco temporário deve ter sido capturado');
+    assert.equal(fs.existsSync(capturedDbPath!), false, 'Arquivo SQLite temporário deve ter sido removido');
+
+    // 2. Arquivos -wal e -shm temporários não devem existir
+    assert.equal(fs.existsSync(`${capturedDbPath}-wal`), false, 'Arquivo -wal não deve existir');
+    assert.equal(fs.existsSync(`${capturedDbPath}-shm`), false, 'Arquivo -shm não deve existir');
+
+    // 3. Diretório de backups não foi abandonado (ou foi limpo caso iniciado)
+    // Na ordem de withTestServer, a falha ocorre antes de mkdirSync(testBackupDir), portanto nenhum diretório de backup foi criado
+    assert.equal(getRawSafetyBackupDir(), sentinelSafetyDir, 'safetyBackupDir permanece/restaurado para o sentinela');
+
+    // 4. O estado global DEVE ter sido restaurado para o sentinela prévio
     assert.equal(getDbInstance(), sentinelDb, 'dbInstance restaurado após falha nas migrações');
     assert.equal(getRawSafetyBackupDir(), sentinelSafetyDir, 'safetyBackupDir restaurado após falha nas migrações');
+    assert.equal(getTestMode(), sentinelTestMode, 'testMode restaurado após falha nas migrações');
+
+    // 5. Banco sentinela permanece aberto e operacional
+    const check = sentinelDb.prepare('SELECT 77 as code').get() as any;
+    assert.equal(check.code, 77, 'Banco sentinela continua aberto e operacional');
+
+    // 6. Arquivos e diretórios preexistentes são preservados
+    assert.ok(fs.existsSync(preexistingFile), 'Arquivo preexistente preservado');
+    assert.ok(fs.existsSync(preexistingDir), 'Diretório preexistente preservado');
+    assert.ok(fs.existsSync(preexistingNestedFile), 'Conteúdo interno do diretório preservado');
   } finally {
     DatabaseSync.prototype.exec = origExec;
     sentinelDb.close();
     setDbInstance(null);
     setSafetyBackupDir(null);
+    setTestMode(null);
+    if (fs.existsSync(preexistingFile)) fs.unlinkSync(preexistingFile);
+    if (fs.existsSync(preexistingDir)) fs.rmSync(preexistingDir, { recursive: true, force: true });
   }
 });
 
@@ -1915,6 +2005,111 @@ test('RC5.10 - Fila de mutex: uma falha na primeira execução não bloqueia nem
   assert.equal((results[0] as PromiseRejectedResult).reason.message, 'Falha simulada na primeira tarefa serializada do mutex');
   assert.equal(results[1].status, 'fulfilled');
 });
+
+test('RC5.11 - app.listen(): erro assíncrono emitido pelo servidor antes de concluir a inicialização limpa recursos e rejeita adequadamente', async () => {
+  const sentinelDb = new DatabaseSync(':memory:');
+  const sentinelSafetyDir = '/tmp/sentinel_async_listen_fail';
+  const sentinelTestMode = false;
+  setDbInstance(sentinelDb);
+  setSafetyBackupDir(sentinelSafetyDir);
+  setTestMode(sentinelTestMode);
+
+  // Arquivos e diretórios preexistentes que devem ser rigorosamente preservados
+  const preexistingFile = path.resolve('/tmp', `preexisting_async_listen_${crypto.randomUUID()}.txt`);
+  const preexistingDir = path.resolve('/tmp', `preexisting_async_dir_${crypto.randomUUID()}`);
+  fs.writeFileSync(preexistingFile, 'arquivo preexistente async listen');
+  fs.mkdirSync(preexistingDir, { recursive: true });
+  const preexistingNested = path.resolve(preexistingDir, 'nested.txt');
+  fs.writeFileSync(preexistingNested, 'conteudo aninhado');
+
+  let capturedDbPath: string | null = null;
+  let capturedBackupDir: string | null = null;
+  let partialServerClosed = false;
+  let errorEmitted = false;
+
+  const originalListen = express.application.listen;
+
+  (express.application as any).listen = function () {
+    const currentDb = getDbInstance();
+    if (currentDb) {
+      const list = currentDb.prepare('PRAGMA database_list').all() as any[];
+      capturedDbPath = list.find((d: any) => d.name === 'main')?.file || null;
+    }
+    capturedBackupDir = getRawSafetyBackupDir();
+
+    assert.ok(capturedDbPath && fs.existsSync(capturedDbPath), 'Arquivo SQLite deve existir antes do erro');
+    assert.ok(capturedBackupDir && fs.existsSync(capturedBackupDir), 'Diretório de backup deve existir antes do erro');
+
+    // Cria servidor HTTP real para simular evento 'error' assíncrono antes do evento de 'listening'
+    const serverInstance = http.createServer();
+    const origClose = serverInstance.close.bind(serverInstance);
+
+    serverInstance.close = function (cb?: any) {
+      partialServerClosed = true;
+      return origClose(cb);
+    };
+
+    // Emite o evento 'error' assincronamente via process.nextTick antes de concluir a inicialização
+    process.nextTick(() => {
+      errorEmitted = true;
+      serverInstance.emit('error', new Error('Falha assíncrona simulada de inicialização no servidor HTTP (ex: EADDRINUSE)'));
+    });
+
+    return serverInstance;
+  };
+
+  try {
+    await assert.rejects(
+      async () => {
+        await withTestServer(async () => {});
+      },
+      (err: any) => {
+        // Garante que o erro original esperado foi o que rejeitou a Promise (sem substituição por erro de limpeza)
+        assert.equal(err.message, 'Falha assíncrona simulada de inicialização no servidor HTTP (ex: EADDRINUSE)');
+        return true;
+      }
+    );
+
+    // 1. O evento assíncrono de erro foi emitido
+    assert.ok(errorEmitted, 'Evento de erro assíncrono deve ter sido emitido');
+
+    // 2. O servidor parcial é encerrado quando aplicável
+    assert.ok(partialServerClosed, 'Servidor parcial deve ter sido encerrado via close()');
+
+    // 3. O banco temporário e arquivos auxiliares (-wal e -shm) são removidos
+    assert.ok(capturedDbPath, 'dbPath temporário deve ter sido capturado');
+    assert.equal(fs.existsSync(capturedDbPath!), false, 'Arquivo SQLite temporário deve ter sido removido');
+    assert.equal(fs.existsSync(`${capturedDbPath}-wal`), false, 'Arquivo -wal temporário não deve existir');
+    assert.equal(fs.existsSync(`${capturedDbPath}-shm`), false, 'Arquivo -shm temporário não deve existir');
+
+    // 4. Diretório temporário de backups é removido
+    assert.ok(capturedBackupDir, 'backupDir temporário deve ter sido capturado');
+    assert.equal(fs.existsSync(capturedBackupDir!), false, 'Diretório temporário de backups deve ter sido removido');
+
+    // 5. As referências globais anteriores são restauradas
+    assert.equal(getDbInstance(), sentinelDb, 'dbInstance restaurado após erro assíncrono');
+    assert.equal(getRawSafetyBackupDir(), sentinelSafetyDir, 'safetyBackupDir restaurado após erro assíncrono');
+    assert.equal(getTestMode(), sentinelTestMode, 'testMode restaurado após erro assíncrono');
+
+    // 6. Banco sentinela permanece aberto e operacional
+    const check = sentinelDb.prepare('SELECT 88 as val').get() as any;
+    assert.equal(check.val, 88, 'Banco sentinela continua aberto e funcional');
+
+    // 7. Arquivos e diretórios preexistentes são rigorosamente preservados
+    assert.ok(fs.existsSync(preexistingFile), 'Arquivo preexistente preservado');
+    assert.ok(fs.existsSync(preexistingDir), 'Diretório preexistente preservado');
+    assert.ok(fs.existsSync(preexistingNested), 'Conteúdo aninhado preexistente preservado');
+  } finally {
+    (express.application as any).listen = originalListen;
+    sentinelDb.close();
+    setDbInstance(null);
+    setSafetyBackupDir(null);
+    setTestMode(null);
+    if (fs.existsSync(preexistingFile)) fs.unlinkSync(preexistingFile);
+    if (fs.existsSync(preexistingDir)) fs.rmSync(preexistingDir, { recursive: true, force: true });
+  }
+});
+
 
 
 

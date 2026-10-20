@@ -130,14 +130,19 @@ export async function withTestServer(
       // 4. Limpeza rigorosa e restauração de estado preservando a causa original em caso de falha
       const cleanupErrors: unknown[] = [];
 
-      // Fechar servidor HTTP criado por este teste
-      if (server) {
+      // Fechar servidor HTTP criado por este teste quando aplicável
+      if (server && typeof server.close === 'function') {
         try {
           await new Promise<void>((resolve, reject) => {
-            server.close((err: any) => {
-              if (err) reject(err);
-              else resolve();
-            });
+            try {
+              server.close((err: any) => {
+                if (err && err.code !== 'ERR_SERVER_NOT_RUNNING') reject(err);
+                else resolve();
+              });
+            } catch (syncErr: any) {
+              if (syncErr && syncErr.code === 'ERR_SERVER_NOT_RUNNING') resolve();
+              else reject(syncErr);
+            }
           });
         } catch (srvCloseErr) {
           cleanupErrors.push(srvCloseErr);
