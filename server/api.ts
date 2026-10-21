@@ -92,7 +92,7 @@ apiRouter.put('/settings', (req: Request, res: Response) => {
         updated_at = ?
       WHERE id = 1
     `).run(
-      body.studio_name ?? 'FBonilha.mov',
+      body.studio_name ?? 'FBonilha - Produtora Audiovisual',
       body.logo_url ?? '',
       body.primary_color ?? '#4F5D47',
       body.email ?? '',
@@ -136,10 +136,31 @@ apiRouter.get('/equipment', (req: Request, res: Response) => {
   }
 });
 
+// Normalização de nomes de equipamentos para validação estrita de exclusividade
+export function normalizeEquipmentName(name: string): string {
+  return (name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
 apiRouter.post('/equipment', (req: Request, res: Response) => {
   try {
     const db = getDb();
     const b = req.body;
+
+    const trimmedName = typeof b.name === 'string' ? b.name.trim() : '';
+    if (!trimmedName) {
+      return res.status(400).json({ error: 'O nome do equipamento é obrigatório.' });
+    }
+
+    const normalizedCandidate = normalizeEquipmentName(trimmedName);
+    const existingRows = db.prepare('SELECT id, name FROM equipment WHERE is_deleted = 0').all() as Array<{ id: string; name: string }>;
+    const conflict = existingRows.find((r) => normalizeEquipmentName(r.name) === normalizedCandidate);
+
+    if (conflict) {
+      return res.status(400).json({
+        error: `Já existe um equipamento cadastrado com o nome "${conflict.name}". Cada equipamento deve ter um nome exclusivo.`
+      });
+    }
+
     const id = b.id || `eq_${crypto.randomUUID()}`;
     const now = new Date().toISOString();
 
@@ -151,7 +172,7 @@ apiRouter.post('/equipment', (req: Request, res: Response) => {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
     `).run(
       id,
-      b.name,
+      trimmedName,
       b.category ?? 'Geral',
       b.brand ?? '',
       b.model ?? '',
@@ -159,7 +180,7 @@ apiRouter.post('/equipment', (req: Request, res: Response) => {
       b.acquisition_date ?? '',
       parseNumericField(b.purchase_value, 0, { min: 0 }),
       parseNumericField(b.residual_value, 0, { min: 0 }),
-      parseNumericField(b.useful_life_years, 3, { min: 1 }),
+      parseNumericField(b.useful_life_years, 3, { min: 0.5 }),
       b.estimation_method ?? 'total_hours',
       parseNumericField(b.total_useful_hours, 2500, { min: 1 }),
       parseNumericField(b.annual_hours, 600, { min: 1 }),
@@ -172,6 +193,11 @@ apiRouter.post('/equipment', (req: Request, res: Response) => {
     const created = db.prepare('SELECT * FROM equipment WHERE id = ?').get(id);
     res.status(201).json(created);
   } catch (error: any) {
+    if (error && error.message && error.message.includes('UNIQUE constraint failed')) {
+      return res.status(400).json({
+        error: 'Já existe um equipamento cadastrado com este nome. Cada equipamento deve ter um nome exclusivo.'
+      });
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -181,6 +207,22 @@ apiRouter.put('/equipment/:id', (req: Request, res: Response) => {
     const db = getDb();
     const id = req.params.id;
     const b = req.body;
+
+    const trimmedName = typeof b.name === 'string' ? b.name.trim() : '';
+    if (!trimmedName) {
+      return res.status(400).json({ error: 'O nome do equipamento é obrigatório.' });
+    }
+
+    const normalizedCandidate = normalizeEquipmentName(trimmedName);
+    const existingRows = db.prepare('SELECT id, name FROM equipment WHERE is_deleted = 0 AND id != ?').all(id) as Array<{ id: string; name: string }>;
+    const conflict = existingRows.find((r) => normalizeEquipmentName(r.name) === normalizedCandidate);
+
+    if (conflict) {
+      return res.status(400).json({
+        error: `Já existe outro equipamento cadastrado com o nome "${conflict.name}". Cada equipamento deve ter um nome exclusivo.`
+      });
+    }
+
     const now = new Date().toISOString();
 
     db.prepare(`
@@ -202,7 +244,7 @@ apiRouter.put('/equipment/:id', (req: Request, res: Response) => {
         updated_at = ?
       WHERE id = ?
     `).run(
-      b.name,
+      trimmedName,
       b.category,
       b.brand ?? '',
       b.model ?? '',
@@ -210,7 +252,7 @@ apiRouter.put('/equipment/:id', (req: Request, res: Response) => {
       b.acquisition_date ?? '',
       parseNumericField(b.purchase_value, 0, { min: 0 }),
       parseNumericField(b.residual_value, 0, { min: 0 }),
-      parseNumericField(b.useful_life_years, 3, { min: 1 }),
+      parseNumericField(b.useful_life_years, 3, { min: 0.5 }),
       b.estimation_method ?? 'total_hours',
       parseNumericField(b.total_useful_hours, 2500, { min: 1 }),
       parseNumericField(b.annual_hours, 600, { min: 1 }),
@@ -223,6 +265,11 @@ apiRouter.put('/equipment/:id', (req: Request, res: Response) => {
     const updated = db.prepare('SELECT * FROM equipment WHERE id = ?').get(id);
     res.json(updated);
   } catch (error: any) {
+    if (error && error.message && error.message.includes('UNIQUE constraint failed')) {
+      return res.status(400).json({
+        error: 'Já existe outro equipamento cadastrado com este nome. Cada equipamento deve ter um nome exclusivo.'
+      });
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -767,7 +814,7 @@ apiRouter.post('/budgets', (req: Request, res: Response) => {
       b.description ?? '',
       b.scope_summary ?? '',
       b.internal_notes ?? '',
-      b.responsible ?? 'FBonilha',
+      b.responsible ?? 'FBonilha - Produtora Audiovisual',
       b.status ?? 'draft',
       b.template_id ?? null,
       JSON.stringify(b.stages || []),
@@ -832,7 +879,7 @@ apiRouter.put('/budgets/:id', (req: Request, res: Response) => {
       b.description ?? '',
       b.scope_summary ?? '',
       b.internal_notes ?? '',
-      b.responsible ?? 'FBonilha',
+      b.responsible ?? 'FBonilha - Produtora Audiovisual',
       b.status ?? 'draft',
       b.template_id ?? null,
       JSON.stringify(b.stages || []),
@@ -977,7 +1024,7 @@ apiRouter.post('/budgets/:id/emit-proposal', (req: Request, res: Response) => {
     const installmentValue = Number((totalPrice / installmentCount).toFixed(2));
 
     const issuerContact = {
-      studioName: settings?.studio_name ?? 'FBonilha.mov',
+      studioName: settings?.studio_name ?? 'FBonilha - Produtora Audiovisual',
       phone: settings?.phone ?? '',
       email: settings?.email ?? '',
       website: settings?.website ?? '',
@@ -1688,7 +1735,7 @@ export function restoreBackupData(
           terms_and_conditions = ?, updated_at = datetime('now')
         WHERE id = 1
       `).run(
-        s.studio_name ?? 'FBonilha.mov',
+        s.studio_name ?? 'FBonilha - Produtora Audiovisual',
         s.logo_url ?? '',
         s.primary_color ?? '#4F5D47',
         s.email ?? '',
@@ -1878,7 +1925,7 @@ export function restoreBackupData(
           b.description ?? '',
           b.scope_summary ?? '',
           b.internal_notes ?? '',
-          b.responsible ?? 'FBonilha',
+          b.responsible ?? 'FBonilha - Produtora Audiovisual',
           b.status ?? 'draft',
           b.template_id ?? null,
           typeof b.stages_snapshot_json === 'string' ? b.stages_snapshot_json : JSON.stringify(b.stages || []),

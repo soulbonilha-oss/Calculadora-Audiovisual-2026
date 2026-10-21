@@ -39,7 +39,7 @@ export const Header: React.FC<HeaderProps> = ({
       case 'backup':
         return 'Backup, Restauração & Integridade';
       default:
-        return 'FBonilha Audiovisual';
+        return 'FBonilha - Produtora Audiovisual';
     }
   };
 

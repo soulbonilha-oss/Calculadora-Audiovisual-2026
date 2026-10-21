@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Plus, Search, Camera, Edit2, Trash2, CheckCircle, XCircle } from 'lucide-react';
+import { Plus, Search, Camera, Edit2, Trash2, CheckCircle, XCircle, Copy, AlertCircle } from 'lucide-react';
 import { Equipment } from '../../types';
 import { calculateEquipmentDepreciation, formatBRL } from '../../financial/engine';
 
@@ -9,7 +9,7 @@ interface EquipmentViewProps {
   onDelete: (id: string) => Promise<void>;
 }
 
-const CATEGORIES = [
+export const CATEGORIES = [
   'Todas',
   'Câmeras',
   'Lentes',
@@ -18,12 +18,17 @@ const CATEGORIES = [
   'Estabilização',
   'Suportes e rigging',
   'Tripés',
+  'Baterias',
   'Cartões e armazenamento',
   'Computadores',
   'Monitores',
   'Acessórios',
   'Outros',
 ];
+
+export const normalizeEquipmentName = (name: string): string => {
+  return (name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+};
 
 export const EquipmentView: React.FC<EquipmentViewProps> = ({
   equipmentList,
@@ -34,8 +39,10 @@ export const EquipmentView: React.FC<EquipmentViewProps> = ({
   const [selectedCategory, setSelectedCategory] = useState('Todas');
   const [isEditing, setIsEditing] = useState(false);
   const [editingItem, setEditingItem] = useState<Partial<Equipment> | null>(null);
+  const [duplicatedFrom, setDuplicatedFrom] = useState<Equipment | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const filtered = equipmentList.filter((eq) => {
     const matchesSearch =
@@ -63,29 +70,89 @@ export const EquipmentView: React.FC<EquipmentViewProps> = ({
       notes: '',
       is_active: 1,
     });
+    setDuplicatedFrom(null);
+    setFormError(null);
     setIsEditing(true);
     setFeedback(null);
   };
 
   const handleOpenEdit = (item: Equipment) => {
     setEditingItem({ ...item });
+    setDuplicatedFrom(null);
+    setFormError(null);
+    setIsEditing(true);
+    setFeedback(null);
+  };
+
+  const handleDuplicate = (item: Equipment) => {
+    // Cria novo cadastro com identificador próprio (sem reutilizar o ID do original)
+    // Preserva parâmetros técnicos e financeiros, exigindo nome próprio e exclusivo
+    setEditingItem({
+      name: '', // Nome deve ser obrigatório e diferente do original
+      category: item.category,
+      brand: item.brand,
+      model: item.model,
+      serial_number: '', // Número de série da nova unidade física
+      purchase_value: item.purchase_value,
+      residual_value: item.residual_value,
+      useful_life_years: item.useful_life_years,
+      estimation_method: item.estimation_method,
+      total_useful_hours: item.total_useful_hours,
+      annual_hours: item.annual_hours,
+      notes: item.notes,
+      is_active: item.is_active,
+    });
+    setDuplicatedFrom(item);
+    setFormError(null);
     setIsEditing(true);
     setFeedback(null);
   };
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingItem || !editingItem.name) return;
+    setFormError(null);
+
+    if (!editingItem) return;
+
+    const rawName = editingItem.name || '';
+    const trimmedName = rawName.trim();
+
+    // 1. Nome obrigatório
+    if (!trimmedName) {
+      setFormError('O nome do equipamento é obrigatório.');
+      return;
+    }
+
+    // 2. Se for duplicata, o nome deve ser diferente do equipamento de origem
+    if (duplicatedFrom && normalizeEquipmentName(trimmedName) === normalizeEquipmentName(duplicatedFrom.name)) {
+      setFormError(`O nome do novo equipamento deve ser diferente do equipamento de origem ("${duplicatedFrom.name}"). Digite uma identificação exclusiva para esta nova unidade.`);
+      return;
+    }
+
+    // 3. Impedir nomes duplicados entre equipamentos cadastrados (normalização de espaços e case-insensitive)
+    const isDuplicate = equipmentList.some((eq) => {
+      if (editingItem.id && eq.id === editingItem.id) return false;
+      return normalizeEquipmentName(eq.name) === normalizeEquipmentName(trimmedName);
+    });
+
+    if (isDuplicate) {
+      setFormError(`Já existe um equipamento cadastrado com o nome "${trimmedName}". Cada equipamento deve ter um nome exclusivo.`);
+      return;
+    }
 
     try {
       setIsSubmitting(true);
-      await onSave(editingItem);
+      await onSave({
+        ...editingItem,
+        name: trimmedName,
+      });
       setIsEditing(false);
       setEditingItem(null);
-      setFeedback('Equipamento salvo com sucesso.');
+      setDuplicatedFrom(null);
+      setFeedback(duplicatedFrom ? 'Equipamento duplicado e cadastrado com sucesso.' : 'Equipamento salvo com sucesso.');
       setTimeout(() => setFeedback(null), 3000);
     } catch (err: any) {
-      alert(`Erro ao salvar equipamento: ${err.message}`);
+      setFormError(err.message || 'Erro ao salvar equipamento.');
     } finally {
       setIsSubmitting(false);
     }
@@ -238,15 +305,28 @@ export const EquipmentView: React.FC<EquipmentViewProps> = ({
                       <td className="py-3.5 px-6 text-right">
                         <div className="flex items-center justify-end gap-2">
                           <button
+                            type="button"
+                            onClick={() => handleDuplicate(item)}
+                            title="Duplicar equipamento"
+                            aria-label={`Duplicar equipamento ${item.name}`}
+                            className="p-1.5 text-slate-400 hover:text-emerald-700 rounded-md hover:bg-emerald-50 transition-colors"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => handleOpenEdit(item)}
                             title="Editar"
+                            aria-label={`Editar equipamento ${item.name}`}
                             className="p-1.5 text-slate-400 hover:text-slate-900 rounded-md hover:bg-slate-100 transition-colors"
                           >
                             <Edit2 className="w-3.5 h-3.5" />
                           </button>
                           <button
+                            type="button"
                             onClick={() => handleDelete(item.id, item.name)}
                             title="Arquivar"
+                            aria-label={`Arquivar equipamento ${item.name}`}
                             className="p-1.5 text-slate-400 hover:text-red-600 rounded-md hover:bg-red-50 transition-colors"
                           >
                             <Trash2 className="w-3.5 h-3.5" />
@@ -269,19 +349,45 @@ export const EquipmentView: React.FC<EquipmentViewProps> = ({
             <div className="flex items-center justify-between pb-4 border-b border-slate-100 mb-6">
               <div>
                 <h3 className="text-base font-bold text-slate-900">
-                  {editingItem.id ? 'Editar Equipamento' : 'Novo Equipamento'}
+                  {duplicatedFrom ? 'Duplicar Equipamento' : editingItem.id ? 'Editar Equipamento' : 'Novo Equipamento'}
                 </h3>
                 <p className="text-xs text-slate-500">
-                  Configure o custo de aquisição e a regra de depreciação por hora
+                  {duplicatedFrom
+                    ? `Criando nova unidade a partir de "${duplicatedFrom.name}". Informe um nome exclusivo e ajuste os parâmetros se necessário.`
+                    : 'Configure o custo de aquisição e a regra de depreciação por hora'}
                 </p>
               </div>
               <button
-                onClick={() => setIsEditing(false)}
+                type="button"
+                onClick={() => {
+                  setIsEditing(false);
+                  setDuplicatedFrom(null);
+                  setFormError(null);
+                }}
                 className="text-slate-400 hover:text-slate-600 text-sm font-medium"
               >
                 Cancelar
               </button>
             </div>
+
+            {formError && (
+              <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2.5 text-xs text-red-700">
+                <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+                <div className="flex-1 font-medium">{formError}</div>
+              </div>
+            )}
+
+            {duplicatedFrom && (
+              <div className="mb-4 p-3 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center justify-between text-xs text-emerald-800">
+                <div className="flex items-center gap-2">
+                  <Copy className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>
+                    Duplicando a partir de: <strong>{duplicatedFrom.name}</strong> ({duplicatedFrom.category})
+                  </span>
+                </div>
+                <span className="text-[11px] text-emerald-600 font-medium">Novo ID será gerado</span>
+              </div>
+            )}
 
             <form onSubmit={handleSave} className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -293,10 +399,22 @@ export const EquipmentView: React.FC<EquipmentViewProps> = ({
                     type="text"
                     required
                     value={editingItem.name || ''}
-                    onChange={(e) => setEditingItem({ ...editingItem, name: e.target.value })}
-                    placeholder="Ex: Cinema Camera Sony FX3"
+                    onChange={(e) => {
+                      setEditingItem({ ...editingItem, name: e.target.value });
+                      if (formError) setFormError(null);
+                    }}
+                    placeholder={
+                      duplicatedFrom
+                        ? `Ex: ${duplicatedFrom.name} 02`
+                        : "Ex: Cinema Camera Sony FX3"
+                    }
                     className="w-full px-3 py-2 text-xs border border-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-700 focus:outline-none"
                   />
+                  {duplicatedFrom && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                      O nome deve ser obrigatório, exclusivo e diferente de "{duplicatedFrom.name}".
+                    </p>
+                  )}
                 </div>
 
                 <div>
@@ -529,7 +647,11 @@ export const EquipmentView: React.FC<EquipmentViewProps> = ({
               <div className="flex justify-end gap-3 pt-4 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => setIsEditing(false)}
+                  onClick={() => {
+                    setIsEditing(false);
+                    setDuplicatedFrom(null);
+                    setFormError(null);
+                  }}
                   className="px-4 py-2 text-xs font-medium text-slate-600 hover:text-slate-800"
                 >
                   Cancelar
@@ -539,7 +661,13 @@ export const EquipmentView: React.FC<EquipmentViewProps> = ({
                   disabled={isSubmitting || !previewDepreciation?.isValid}
                   className="px-5 py-2 text-xs font-semibold text-white bg-emerald-700 rounded-lg hover:bg-emerald-800 disabled:opacity-50 transition-colors shadow-xs"
                 >
-                  {isSubmitting ? 'Salvando...' : 'Salvar Equipamento'}
+                  {isSubmitting
+                    ? 'Salvando...'
+                    : duplicatedFrom
+                    ? 'Salvar Duplicata'
+                    : editingItem.id
+                    ? 'Atualizar Equipamento'
+                    : 'Salvar Equipamento'}
                 </button>
               </div>
             </form>

@@ -2110,6 +2110,328 @@ test('RC5.11 - app.listen(): erro assíncrono emitido pelo servidor antes de con
   }
 });
 
+// ============================================================================
+// ETAPA 6: DUPLICAÇÃO DE EQUIPAMENTOS, UNICIDADE DE NOMES, BATERIAS E PRODUTORA
+// ============================================================================
+
+test('EQ1.1 - Criação e duplicação de equipamento com preservação de parâmetros e novo ID', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    // 1. Cadastra equipamento original
+    const originalPayload = {
+      name: 'Sony FX3 Cinema Line',
+      category: 'Câmeras',
+      brand: 'Sony',
+      model: 'ILME-FX3',
+      serial_number: 'SN-FX3-001',
+      purchase_value: 24000,
+      residual_value: 4000,
+      useful_life_years: 3,
+      estimation_method: 'total_hours',
+      total_useful_hours: 3000,
+      annual_hours: 600,
+      notes: 'Equipamento principal de câmera',
+      is_active: 1,
+    };
+
+    const resCreate = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(originalPayload),
+    });
+    assert.equal(resCreate.status, 201);
+    const createdOriginal = await resCreate.json();
+    assert.ok(createdOriginal.id);
+    assert.equal(createdOriginal.name, 'Sony FX3 Cinema Line');
+
+    // 2. Duplica equipamento com novo nome exclusivo e novo ID
+    const duplicatePayload = {
+      name: 'Sony FX3 Cinema Line Unidade 02',
+      category: createdOriginal.category,
+      brand: createdOriginal.brand,
+      model: createdOriginal.model,
+      serial_number: 'SN-FX3-002',
+      purchase_value: createdOriginal.purchase_value,
+      residual_value: createdOriginal.residual_value,
+      useful_life_years: createdOriginal.useful_life_years,
+      estimation_method: createdOriginal.estimation_method,
+      total_useful_hours: createdOriginal.total_useful_hours,
+      annual_hours: createdOriginal.annual_hours,
+      notes: createdOriginal.notes,
+      is_active: createdOriginal.is_active,
+    };
+
+    const resDup = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(duplicatePayload),
+    });
+    assert.equal(resDup.status, 201);
+    const createdDup = await resDup.json();
+
+    // Validações
+    assert.ok(createdDup.id);
+    assert.notEqual(createdDup.id, createdOriginal.id, 'O ID da duplicata deve ser único e diferente do original');
+    assert.equal(createdDup.name, 'Sony FX3 Cinema Line Unidade 02');
+    assert.equal(createdDup.purchase_value, 24000);
+    assert.equal(createdDup.residual_value, 4000);
+    assert.equal(createdDup.total_useful_hours, 3000);
+    assert.equal(createdDup.brand, 'Sony');
+    assert.equal(createdDup.model, 'ILME-FX3');
+    assert.equal(createdDup.category, 'Câmeras');
+
+    // Verifica no banco de dados que existem ambos os registros distintos
+    const rows = db.prepare('SELECT id, name FROM equipment WHERE id IN (?, ?) AND is_deleted = 0').all(createdOriginal.id, createdDup.id) as any[];
+    assert.equal(rows.length, 2);
+  });
+});
+
+test('EQ1.2 - Rejeição de nome vazio, nulo ou somente espaços em branco', async () => {
+  await withTestServer(async ({ baseUrl }) => {
+    // Tentativa com nome vazio
+    const resEmpty = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: '', purchase_value: 5000 }),
+    });
+    assert.equal(resEmpty.status, 400);
+    const bodyEmpty = await resEmpty.json();
+    assert.ok(bodyEmpty.error.includes('obrigatório'));
+
+    // Tentativa com nome contendo apenas espaços
+    const resSpaces = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: '     ', purchase_value: 5000 }),
+    });
+    assert.equal(resSpaces.status, 400);
+  });
+});
+
+test('EQ1.3 - Rejeição de nomes duplicados com normalização de maiúsculas/minúsculas e espaços', async () => {
+  await withTestServer(async ({ baseUrl }) => {
+    // 1. Cadastra primeiro item
+    const res1 = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Microfone Rode VideoMic Pro',
+        category: 'Áudio',
+        purchase_value: 1800,
+      }),
+    });
+    assert.equal(res1.status, 201);
+
+    // 2. Tentativa com nome idêntico
+    const resSame = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Microfone Rode VideoMic Pro',
+        category: 'Áudio',
+        purchase_value: 1800,
+      }),
+    });
+    assert.equal(resSame.status, 400);
+    const bodySame = await resSame.json();
+    assert.ok(bodySame.error.includes('Já existe um equipamento'));
+
+    // 3. Tentativa com variação em caixa alta/baixa
+    const resCase = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'microfone rode VIDEOMIC pro',
+        category: 'Áudio',
+        purchase_value: 1800,
+      }),
+    });
+    assert.equal(resCase.status, 400);
+
+    // 4. Tentativa com espaços múltiplos e espaços nas pontas
+    const resWhitespace = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: '   Microfone   Rode   VideoMic   Pro   ',
+        category: 'Áudio',
+        purchase_value: 1800,
+      }),
+    });
+    assert.equal(resWhitespace.status, 400);
+  });
+});
+
+test('EQ1.4 - Atualização PUT permite manter o próprio nome mas rejeita colisão com outro item', async () => {
+  await withTestServer(async ({ baseUrl }) => {
+    const resA = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Tripé Manfrotto 504HD', category: 'Suporte', purchase_value: 3500 }),
+    });
+    const eqA = await resA.json();
+
+    const resB = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Monopé Benro', category: 'Suporte', purchase_value: 900 }),
+    });
+    const eqB = await resB.json();
+
+    // 1. Atualizar eqA mantendo o próprio nome: deve ter sucesso
+    const resSelf = await fetch(`${baseUrl}/equipment/${eqA.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...eqA, purchase_value: 3600 }),
+    });
+    assert.equal(resSelf.status, 200);
+
+    // 2. Atualizar eqB para o mesmo nome de eqA: deve ser rejeitado (400)
+    const resCollision = await fetch(`${baseUrl}/equipment/${eqB.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...eqB, name: '   TRIPÉ MANFROTTO 504HD ' }),
+    });
+    assert.equal(resCollision.status, 400);
+  });
+});
+
+test('EQ1.5 - Multi-unidades com identificação sequencial (ex: Cartões SD 01, 02) cadastrados com sucesso', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    const units = [
+      'Cartão SD V60 128 GB 01',
+      'Cartão SD V60 128 GB 02',
+      'Cartão SD V60 128 GB 03',
+    ];
+
+    for (const unitName of units) {
+      const res = await fetch(`${baseUrl}/equipment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: unitName,
+          category: 'Acessórios',
+          brand: 'SanDisk',
+          model: 'Extreme Pro V60',
+          purchase_value: 450,
+          residual_value: 50,
+          useful_life_years: 2,
+          estimation_method: 'total_hours',
+          total_useful_hours: 2000,
+          annual_hours: 500,
+          is_active: 1,
+        }),
+      });
+      assert.equal(res.status, 201);
+    }
+
+    const rows = db.prepare("SELECT name FROM equipment WHERE name LIKE 'Cartão SD%' AND is_deleted = 0 ORDER BY name ASC").all() as any[];
+    assert.equal(rows.length, 3);
+    assert.equal(rows[0].name, 'Cartão SD V60 128 GB 01');
+    assert.equal(rows[1].name, 'Cartão SD V60 128 GB 02');
+    assert.equal(rows[2].name, 'Cartão SD V60 128 GB 03');
+  });
+});
+
+test('EQ1.6 - Categoria Baterias aceita, calcula depreciação e integra em orçamentos', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    // 1. Cadastra bateria
+    const resBat = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Bateria V-Mount 98Wh 01',
+        category: 'Baterias',
+        brand: 'SmallRig',
+        model: 'VB99',
+        purchase_value: 1200,
+        residual_value: 200,
+        useful_life_years: 2,
+        estimation_method: 'total_hours',
+        total_useful_hours: 1000,
+        annual_hours: 500,
+        is_active: 1,
+      }),
+    });
+    assert.equal(resBat.status, 201);
+    const bat = await resBat.json();
+    assert.equal(bat.category, 'Baterias');
+
+    // 2. Consulta pelo endpoint GET
+    const resList = await fetch(`${baseUrl}/equipment`);
+    assert.equal(resList.status, 200);
+    const list = await resList.json();
+    const found = list.find((item: any) => item.category === 'Baterias');
+    assert.ok(found);
+    assert.equal(found.name, 'Bateria V-Mount 98Wh 01');
+
+    // 3. Cadastra orçamento utilizando a bateria
+    const budgetPayload = {
+      title: 'Gravação Institucional com Baterias',
+      client_name: 'Cliente Teste',
+      equipment: [
+        {
+          equipment_id: bat.id,
+          name: bat.name,
+          category: bat.category,
+          hours_used: 10,
+          hourly_depreciation: 1.0, // (1200 - 200) / 1000 = 1.00/h
+          total_depreciation: 10.0,
+        },
+      ],
+      calculatedSummary: {
+        finalBasePrice: 2500,
+      },
+    };
+
+    const resBudget = await fetch(`${baseUrl}/budgets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(budgetPayload),
+    });
+    assert.equal(resBudget.status, 201);
+    const budget = await resBudget.json();
+    assert.ok(budget.id);
+  });
+});
+
+test('EQ1.7 - Identificação institucional da produtora FBonilha - Produtora Audiovisual em configurações e propostas', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    // 1. GET /settings deve conter o nome institucional atualizado
+    const resSettings = await fetch(`${baseUrl}/settings`);
+    assert.equal(resSettings.status, 200);
+    const settings = await resSettings.json();
+    assert.equal(settings.studio_name, 'FBonilha - Produtora Audiovisual');
+
+    // 2. Orçamento sem responsável especificado assume o padrão institucional
+    const resBudget = await fetch(`${baseUrl}/budgets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: 'Comercial Institucional',
+        client_name: 'Empresa Alpha',
+        calculatedSummary: {
+          finalBasePrice: 15000,
+        },
+      }),
+    });
+    assert.equal(resBudget.status, 201);
+    const budget = await resBudget.json();
+    assert.equal(budget.responsible, 'FBonilha - Produtora Audiovisual');
+
+    // 3. Emitir proposta comercial formal deve associar o estúdio institucional como emissor
+    const resProp = await fetch(`${baseUrl}/budgets/${budget.id}/emit-proposal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        totalPrice: 15000,
+      }),
+    });
+    assert.equal(resProp.status, 201);
+    const prop = await resProp.json();
+    assert.equal(prop.issuerContact.studioName, 'FBonilha - Produtora Audiovisual');
+  });
+});
+
 
 
 

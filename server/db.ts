@@ -112,7 +112,7 @@ export function runMigrations(db: DatabaseSync) {
       -- Configurações gerais da produtora
       CREATE TABLE IF NOT EXISTS settings (
         id INTEGER PRIMARY KEY CHECK (id = 1),
-        studio_name TEXT NOT NULL DEFAULT 'FBonilha Audiovisual',
+        studio_name TEXT NOT NULL DEFAULT 'FBonilha - Produtora Audiovisual',
         logo_url TEXT DEFAULT '',
         primary_color TEXT NOT NULL DEFAULT '#059669',
         email TEXT DEFAULT 'contato@fbonilha.com.br',
@@ -345,6 +345,24 @@ export function runMigrations(db: DatabaseSync) {
 
     db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, datetime(\'now\'))')
       .run(4, 'fix_sample_data_flag_and_protect_user_data');
+  }
+
+  if (!appliedVersions.has(5)) {
+    // Migration 5: Atualização institucional do nome da produtora para 'FBonilha - Produtora Audiovisual'
+    // e criação de índice exclusivo para nomes de equipamentos ativos
+    db.exec(`
+      UPDATE settings SET
+        studio_name = 'FBonilha - Produtora Audiovisual',
+        updated_at = datetime('now')
+      WHERE id = 1;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_equipment_unique_name
+      ON equipment (LOWER(TRIM(name)))
+      WHERE is_deleted = 0;
+    `);
+
+    db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, datetime(\'now\'))')
+      .run(5, 'update_studio_name_and_equipment_unique_index');
   }
 }
 

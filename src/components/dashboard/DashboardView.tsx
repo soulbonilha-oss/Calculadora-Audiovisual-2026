@@ -71,7 +71,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             Painel Estratégico de Precificação
           </span>
           <h2 className="text-2xl font-bold text-slate-900 mt-1">
-            {settings?.studio_name || 'FBonilha Audiovisual'}
+            {settings?.studio_name || 'FBonilha - Produtora Audiovisual'}
           </h2>
           <p className="text-sm text-slate-500 mt-1 max-w-xl">
             Cálculo analítico de depreciação, rateio de custos fixos por hora faturável e formação de preço com propostas comerciais sem exposição de custos internos.

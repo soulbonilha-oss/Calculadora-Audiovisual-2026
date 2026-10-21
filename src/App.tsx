@@ -103,7 +103,7 @@ export default function App() {
       description: '',
       scope_summary: '',
       internal_notes: '',
-      responsible: settings?.studio_name || 'FBonilha',
+      responsible: settings?.studio_name || 'FBonilha - Produtora Audiovisual',
       status: 'draft',
       stages: [
         { id: 's1', name: 'Planejamento e Roteiro', hours: 4, hourlyRate: settings?.default_hourly_rate || 150, commercialGroup: 'pre', isProfessionalLabor: true, isOverheadEligible: true },
@@ -160,7 +160,7 @@ export default function App() {
         installmentCount: tpl.pricingConfig?.installmentCount ?? settings?.default_installments ?? 4,
       },
       status: 'draft',
-      responsible: settings?.studio_name || 'FBonilha',
+      responsible: settings?.studio_name || 'FBonilha - Produtora Audiovisual',
     });
     setActiveView('budget_editor');
   };
@@ -289,7 +289,7 @@ export default function App() {
           <p className="text-sm font-semibold text-slate-800">
             Conectando ao banco de dados SQLite local...
           </p>
-          <p className="text-xs text-slate-400">FBonilha Audiovisual</p>
+          <p className="text-xs text-slate-400">FBonilha - Produtora Audiovisual</p>
         </div>
       </div>
     );

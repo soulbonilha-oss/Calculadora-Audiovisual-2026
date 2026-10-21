@@ -95,7 +95,7 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
     description: initialBudget.description || '',
     scope_summary: initialBudget.scope_summary || '',
     internal_notes: initialBudget.internal_notes || '',
-    responsible: initialBudget.responsible || 'FBonilha',
+    responsible: initialBudget.responsible || settings?.studio_name || 'FBonilha - Produtora Audiovisual',
     status: (initialBudget.status as BudgetStatus) || 'draft',
     template_id: initialBudget.template_id || null,
     stages: initialBudget.stages || [
@@ -588,7 +588,7 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
               </label>
               <input
                 type="text"
-                value={budget.responsible || 'FBonilha'}
+                value={budget.responsible || settings?.studio_name || 'FBonilha - Produtora Audiovisual'}
                 onChange={(e) => {
                   setBudget({ ...budget, responsible: e.target.value });
                   setSaveStatus('dirty');
@@ -1926,7 +1926,7 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
               <div className="flex items-start justify-between pb-6 border-b border-slate-200">
                 <div>
                   <h1 className="text-xl font-bold text-emerald-800">
-                    {settings?.studio_name || 'FBonilha Audiovisual'}
+                    {settings?.studio_name || 'FBonilha - Produtora Audiovisual'}
                   </h1>
                   <p className="text-xs text-slate-500 mt-1">
                     {[settings?.phone, settings?.email, settings?.website].filter(Boolean).join(' · ')}
@@ -2046,7 +2046,7 @@ export const BudgetEditorView: React.FC<BudgetEditorViewProps> = ({
 
               {/* Rodapé da Proposta */}
               <div className="pt-6 border-t border-slate-200 text-[10px] text-slate-400 flex justify-between items-center">
-                <span>{settings?.studio_name || 'FBonilha Audiovisual'} · Documento oficial de orçamento</span>
+                <span>{settings?.studio_name || 'FBonilha - Produtora Audiovisual'} · Documento oficial de orçamento</span>
                 <span>Proposta confidencial</span>
               </div>
             </div>

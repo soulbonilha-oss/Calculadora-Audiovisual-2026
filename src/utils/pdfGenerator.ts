@@ -57,7 +57,7 @@ export function generateCommercialProposalPdf(data: CommercialProposalData): jsP
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(22);
   doc.setTextColor(primaryColor);
-  doc.text(data.settings.studio_name || 'FBonilha.mov', margin, currentY);
+  doc.text(data.settings.studio_name || 'FBonilha - Produtora Audiovisual', margin, currentY);
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(9);
@@ -298,7 +298,7 @@ export function generateCommercialProposalPdf(data: CommercialProposalData): jsP
   doc.setFontSize(7.5);
   doc.setTextColor(mutedTextColor);
   doc.text(
-    `${data.settings.studio_name || 'FBonilha Audiovisual'}  ·  Documento oficial gerado localmente em ${formatDateBR(data.issueDate)}`,
+    `${data.settings.studio_name || 'FBonilha - Produtora Audiovisual'}  ·  Documento oficial gerado localmente em ${formatDateBR(data.issueDate)}`,
     margin,
     pageHeight - 10
   );
