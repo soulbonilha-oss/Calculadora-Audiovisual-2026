@@ -28,6 +28,12 @@ import {
   CANONICAL_SAMPLE_IDS,
   setTestMode,
   getTestMode,
+  applyMigration5,
+  ensureEquipmentSchemaNormalized,
+  EquipmentNameConflictError,
+  getEquipmentNameConflicts,
+  setAllowStartupWithConflicts,
+  getAllowStartupWithConflicts,
 } from './db.js';
 import { generateCommercialProposalPdf } from '../src/utils/pdfGenerator.js';
 import { calculateProjectPricing } from '../src/financial/engine.js';
@@ -2688,6 +2694,327 @@ test('EQ1.9 - Duplicação de equipamento preserva todos os parâmetros com ID d
     assert.equal(dup.notes, orig.notes);
     assert.equal(dup.is_active, orig.is_active);
   });
+});
+
+// ============================================================================
+// ETAPA 7: MIGRAÇÃO 5 SEGURA, PRESERVAÇÃO DE DADOS, NOMES INSTITUCIONAIS E UNICIDADE
+// ============================================================================
+
+function createLegacyV4Database(): DatabaseSync {
+  const db = new DatabaseSync(':memory:');
+  db.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      applied_at TEXT NOT NULL
+    );
+    INSERT INTO schema_migrations VALUES (1, 'initial_schema_and_seed', datetime('now'));
+    INSERT INTO schema_migrations VALUES (2, 'brand_identity_fbonilha_mov', datetime('now'));
+    INSERT INTO schema_migrations VALUES (3, 'add_is_sample_flag_to_entities', datetime('now'));
+    INSERT INTO schema_migrations VALUES (4, 'fix_sample_data_flag_and_protect_user_data', datetime('now'));
+
+    CREATE TABLE settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      studio_name TEXT NOT NULL DEFAULT 'FBonilha.mov',
+      logo_url TEXT DEFAULT '',
+      primary_color TEXT NOT NULL DEFAULT '#4F5D47',
+      email TEXT DEFAULT 'contato@fbonilha.mov',
+      phone TEXT DEFAULT '(11) 98765-4321',
+      website TEXT DEFAULT 'www.fbonilha.mov',
+      address TEXT DEFAULT 'São Paulo, SP',
+      cnpj TEXT DEFAULT '00.000.000/0001-00',
+      default_hourly_rate REAL NOT NULL DEFAULT 150.0,
+      default_billable_hours_month REAL NOT NULL DEFAULT 100.0,
+      default_pricing_method TEXT NOT NULL DEFAULT 'margin_on_sale',
+      default_profit_margin_pct REAL NOT NULL DEFAULT 25.0,
+      default_markup_pct REAL NOT NULL DEFAULT 35.0,
+      default_tax_pct REAL NOT NULL DEFAULT 6.0,
+      default_financial_fee_pct REAL NOT NULL DEFAULT 2.5,
+      default_fixed_fee REAL NOT NULL DEFAULT 0.0,
+      default_cash_discount_pct REAL NOT NULL DEFAULT 10.0,
+      default_installments INTEGER NOT NULL DEFAULT 4,
+      proposal_valid_days INTEGER NOT NULL DEFAULT 7,
+      default_notes TEXT DEFAULT '',
+      terms_and_conditions TEXT DEFAULT '',
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO settings (id, studio_name, updated_at) VALUES (1, 'FBonilha.mov', datetime('now'));
+
+    CREATE TABLE equipment (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL DEFAULT 'Geral',
+      brand TEXT DEFAULT '',
+      model TEXT DEFAULT '',
+      serial_number TEXT DEFAULT '',
+      acquisition_date TEXT DEFAULT '',
+      purchase_value REAL NOT NULL DEFAULT 0.0,
+      residual_value REAL NOT NULL DEFAULT 0.0,
+      useful_life_years REAL NOT NULL DEFAULT 3.0,
+      estimation_method TEXT NOT NULL DEFAULT 'total_hours',
+      total_useful_hours REAL NOT NULL DEFAULT 2500.0,
+      annual_hours REAL NOT NULL DEFAULT 600.0,
+      notes TEXT DEFAULT '',
+      is_active INTEGER NOT NULL DEFAULT 1,
+      is_sample INTEGER NOT NULL DEFAULT 0,
+      is_deleted INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+  return db;
+}
+
+test('MIG5.1 - Migração de um banco legado sem conflitos aplica a versão 5 e cria índice único normalizado', () => {
+  const db = createLegacyV4Database();
+  try {
+    db.prepare('INSERT INTO equipment (id, name, purchase_value) VALUES (?, ?, ?)').run('eq1', 'Sony FX3', 25000);
+    db.prepare('INSERT INTO equipment (id, name, purchase_value) VALUES (?, ?, ?)').run('eq2', 'Lente 24-70mm', 15000);
+
+    runMigrations(db);
+
+    const migrations = db.prepare('SELECT version FROM schema_migrations WHERE version = 5').all();
+    assert.equal(migrations.length, 1, 'Versão 5 deve ser registrada no schema_migrations');
+
+    const tableInfo = db.prepare('PRAGMA table_info(equipment)').all() as any[];
+    assert.ok(tableInfo.some((c: any) => c.name === 'normalized_name'), 'Coluna normalized_name deve existir');
+
+    const eq1 = db.prepare('SELECT * FROM equipment WHERE id = ?').get('eq1') as any;
+    assert.equal(eq1.normalized_name, 'sony fx3');
+
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='equipment'").all() as any[];
+    assert.ok(indexes.some((i: any) => i.name === 'idx_equipment_unique_normalized_name'));
+  } finally {
+    db.close();
+  }
+});
+
+test('MIG5.2 - Migração de um banco com nomes duplicados detecta conflito previamente e bloqueia a migração com erro acionável', () => {
+  const db = createLegacyV4Database();
+  try {
+    db.prepare('INSERT INTO equipment (id, name, purchase_value) VALUES (?, ?, ?)').run('eq1', 'Tripé Manfrotto 504HD', 3500);
+    db.prepare('INSERT INTO equipment (id, name, purchase_value) VALUES (?, ?, ?)').run('eq2', '   TRIPÉ   MANFROTTO   504HD  ', 3500);
+
+    assert.throws(
+      () => {
+        runMigrations(db);
+      },
+      (err: any) => {
+        assert.ok(err instanceof EquipmentNameConflictError || err.name === 'EquipmentNameConflictError');
+        assert.ok(err.message.includes('[MIGRATION 5 CONFLICT]'));
+        assert.ok(err.message.includes('tripé manfrotto 504hd'));
+        assert.ok(err.message.includes('eq1'));
+        assert.ok(err.message.includes('eq2'));
+        return true;
+      }
+    );
+
+    const migrations = db.prepare('SELECT version FROM schema_migrations WHERE version = 5').all();
+    assert.equal(migrations.length, 0, 'Versão 5 NÃO deve ser registrada em caso de conflito');
+  } finally {
+    db.close();
+  }
+});
+
+test('MIG5.3 - Falha durante a criação do índice executa ROLLBACK sem alteração parcial dos dados', () => {
+  const db = createLegacyV4Database();
+  try {
+    db.prepare("UPDATE settings SET studio_name = 'Nome Customizado Precioso' WHERE id = 1").run();
+    db.prepare('INSERT INTO equipment (id, name, purchase_value) VALUES (?, ?, ?)').run('eq1', 'Câmera Red Komodo', 45000);
+    db.prepare('INSERT INTO equipment (id, name, purchase_value) VALUES (?, ?, ?)').run('eq2', 'câmera   red   komodo', 45000);
+
+    assert.throws(() => runMigrations(db));
+
+    // 1. studio_name permanece intacto com o valor anterior
+    const settings = db.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any;
+    assert.equal(settings.studio_name, 'Nome Customizado Precioso', 'Configurações não devem sofrer alteração parcial após rollback');
+
+    // 2. schema_migrations não tem versão 5
+    const v5 = db.prepare('SELECT version FROM schema_migrations WHERE version = 5').all();
+    assert.equal(v5.length, 0);
+
+    // 3. Nenhum equipamento foi excluído ou modificado
+    const count = (db.prepare('SELECT count(*) as c FROM equipment').get() as any).c;
+    assert.equal(count, 2, 'Todos os equipamentos originais devem ser preservados sem perda');
+  } finally {
+    db.close();
+  }
+});
+
+test('MIG5.4 - Reexecução segura da migração após regularização dos dados conflitantes', () => {
+  const db = createLegacyV4Database();
+  try {
+    db.prepare('INSERT INTO equipment (id, name) VALUES (?, ?)').run('eq1', 'Lente 50mm f/1.2 GM');
+    db.prepare('INSERT INTO equipment (id, name) VALUES (?, ?)').run('eq2', 'lente   50mm   f/1.2   gm');
+
+    // Primeira tentativa: falha previsível
+    assert.throws(() => runMigrations(db));
+
+    // Regularização pelo usuário: renomeia a unidade 2
+    db.prepare("UPDATE equipment SET name = 'Lente 50mm f/1.2 GM Unidade 02' WHERE id = 'eq2'").run();
+
+    // Segunda tentativa: reexecução bem-sucedida
+    runMigrations(db);
+
+    const v5 = db.prepare('SELECT version FROM schema_migrations WHERE version = 5').all();
+    assert.equal(v5.length, 1, 'Versão 5 deve ser concluída com sucesso após regularização');
+
+    const rows = db.prepare('SELECT id, name, normalized_name FROM equipment ORDER BY id ASC').all() as any[];
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].normalized_name, 'lente 50mm f/1.2 gm');
+    assert.equal(rows[1].normalized_name, 'lente 50mm f/1.2 gm unidade 02');
+  } finally {
+    db.close();
+  }
+});
+
+test('MIG5.5 - Preservação de nomes personalizados na tabela settings', () => {
+  const db = createLegacyV4Database();
+  try {
+    db.prepare("UPDATE settings SET studio_name = 'Minha Produtora Independente Ltda' WHERE id = 1").run();
+    db.prepare('INSERT INTO equipment (id, name) VALUES (?, ?)').run('eq1', 'Microfone Lapela');
+
+    runMigrations(db);
+
+    const settings = db.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any;
+    assert.equal(settings.studio_name, 'Minha Produtora Independente Ltda', 'Nome customizado pelo usuário deve ser estritamente preservado');
+  } finally {
+    db.close();
+  }
+});
+
+test('MIG5.6 - Substituição correta do nome legado FBonilha.mov para FBonilha - Produtora Audiovisual', () => {
+  const db = createLegacyV4Database();
+  try {
+    // Banco legado contém o nome padrão anterior 'FBonilha.mov'
+    db.prepare("UPDATE settings SET studio_name = 'FBonilha.mov' WHERE id = 1").run();
+
+    runMigrations(db);
+
+    const settings = db.prepare('SELECT studio_name FROM settings WHERE id = 1').get() as any;
+    assert.equal(settings.studio_name, 'FBonilha - Produtora Audiovisual', 'Nome legado FBonilha.mov deve ser atualizado para a denominação institucional oficial');
+  } finally {
+    db.close();
+  }
+});
+
+test('MIG5.7 - Rejeição de nomes duplicados com diferenças de maiúsculas, minúsculas e espaços redundantes', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    // 1. Cadastra item original
+    const res1 = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Cartão CFexpress Type A 160GB', category: 'Acessórios' }),
+    });
+    assert.equal(res1.status, 201);
+
+    // 2. Tenta cadastrar variação com múltiplos espaços e caixa mista
+    const res2 = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: '   cartão    CFEXPRESS    type    a    160gb   ', category: 'Acessórios' }),
+    });
+    assert.equal(res2.status, 400);
+    const body2 = await res2.json();
+    assert.ok(body2.error.includes('Já existe um equipamento cadastrado'));
+
+    // 3. Testa diretamente a restrição no SQLite para assegurar proteção contra bypass da API
+    assert.throws(
+      () => {
+        db.prepare(`
+          INSERT INTO equipment (id, name, normalized_name, category)
+          VALUES ('eq_bypass', 'Cartão CFexpress Type A 160GB', 'cartão cfexpress type a 160gb', 'Acessórios')
+        `).run();
+      },
+      (err: any) => {
+        assert.ok(err.message.includes('UNIQUE constraint failed'));
+        return true;
+      }
+    );
+  });
+});
+
+test('MIG5.8 - Integridade de todos os registros e dos IDs preservada após a migração', () => {
+  const db = createLegacyV4Database();
+  try {
+    const originalItems = [
+      { id: 'eq_custom_001', name: 'Kit Teleprompter 12"', value: 2800, hours: 1500, notes: 'Com tablet incluso' },
+      { id: 'eq_custom_002', name: 'Gravador Zoom H6 Black', value: 2400, hours: 3000, notes: 'Cápsula XY' },
+      { id: 'eq_custom_003', name: 'Monitor Atomos Ninja V', value: 5500, hours: 4000, notes: 'Com 2x SSD 500GB' },
+    ];
+
+    for (const it of originalItems) {
+      db.prepare(`
+        INSERT INTO equipment (id, name, purchase_value, total_useful_hours, notes)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(it.id, it.name, it.value, it.hours, it.notes);
+    }
+
+    runMigrations(db);
+
+    for (const it of originalItems) {
+      const row = db.prepare('SELECT * FROM equipment WHERE id = ?').get(it.id) as any;
+      assert.ok(row, `Equipamento ${it.id} deve continuar existindo`);
+      assert.equal(row.name, it.name);
+      assert.equal(row.purchase_value, it.value);
+      assert.equal(row.total_useful_hours, it.hours);
+      assert.equal(row.notes, it.notes);
+      assert.ok(row.normalized_name, 'normalized_name deve estar preenchido');
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test('MIG5.9 - Criação de equipamentos concorrentes com o mesmo nome é garantidamente bloqueada no banco', async () => {
+  await withTestServer(async ({ baseUrl, db }) => {
+    // Simula duas requisições concorrentes disparadas simultaneamente
+    const p1 = fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Transmissor Hollyland Mars 4K', category: 'Acessórios' }),
+    });
+
+    const p2 = fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: '  transmissor   hollyland   mars   4k  ', category: 'Acessórios' }),
+    });
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    const statuses = [r1.status, r2.status].sort();
+
+    // Uma deve ter sucesso (201) e a outra deve ser rejeitada (400)
+    assert.deepEqual(statuses, [201, 400], 'Apenas uma criação concorrente com o mesmo nome pode ser aceita');
+
+    const rows = db.prepare("SELECT * FROM equipment WHERE normalized_name = 'transmissor hollyland mars 4k'").all();
+    assert.equal(rows.length, 1, 'Exatamente um registro deve persistir no banco');
+  });
+});
+
+test('MIG5.10 - Preservação dos registros arquivados (is_deleted = 1) e coexistência sem conflito', () => {
+  const db = createLegacyV4Database();
+  try {
+    // Três equipamentos com o mesmo nome: dois arquivados e um ativo
+    db.prepare("INSERT INTO equipment (id, name, is_deleted) VALUES ('eq_arch_1', 'Câmera Canon 5D Mark III', 1)").run();
+    db.prepare("INSERT INTO equipment (id, name, is_deleted) VALUES ('eq_arch_2', '  câmera   canon   5d   mark   iii  ', 1)").run();
+    db.prepare("INSERT INTO equipment (id, name, is_deleted) VALUES ('eq_active', 'Câmera Canon 5D Mark III', 0)").run();
+
+    // A migração deve ter sucesso sem conflito, pois o índice único é filtrado por WHERE is_deleted = 0
+    runMigrations(db);
+
+    const v5 = db.prepare('SELECT version FROM schema_migrations WHERE version = 5').all();
+    assert.equal(v5.length, 1, 'Migração deve concluir mesmo com itens arquivados homônimos');
+
+    const total = (db.prepare('SELECT count(*) as c FROM equipment').get() as any).c;
+    assert.equal(total, 3, 'Todos os registros arquivados e ativos devem ser preservados');
+
+    const active = db.prepare('SELECT id, name FROM equipment WHERE is_deleted = 0').all() as any[];
+    assert.equal(active.length, 1);
+    assert.equal(active[0].id, 'eq_active');
+  } finally {
+    db.close();
+  }
 });
 
 

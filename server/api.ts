@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { getDb, DB_PATH, clearSampleData, restoreSampleData, listSampleData, isTestEnvironment } from './db.js';
+import { getDb, DB_PATH, clearSampleData, restoreSampleData, listSampleData, isTestEnvironment, normalizeEquipmentName } from './db.js';
 import {
   calculateEquipmentDepreciation,
   calculateOwnLabor,
@@ -137,9 +137,7 @@ apiRouter.get('/equipment', (req: Request, res: Response) => {
 });
 
 // Normalização de nomes de equipamentos para validação estrita de exclusividade
-export function normalizeEquipmentName(name: string): string {
-  return (name || '').trim().replace(/\s+/g, ' ').toLowerCase();
-}
+export { normalizeEquipmentName } from './db.js';
 
 apiRouter.post('/equipment', (req: Request, res: Response) => {
   try {
@@ -166,13 +164,14 @@ apiRouter.post('/equipment', (req: Request, res: Response) => {
 
     db.prepare(`
       INSERT INTO equipment (
-        id, name, category, brand, model, serial_number, acquisition_date,
+        id, name, normalized_name, category, brand, model, serial_number, acquisition_date,
         purchase_value, residual_value, useful_life_years, estimation_method,
         total_useful_hours, annual_hours, notes, is_active, is_deleted, is_sample, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
     `).run(
       id,
       trimmedName,
+      normalizedCandidate,
       b.category ?? 'Geral',
       b.brand ?? '',
       b.model ?? '',
@@ -193,9 +192,9 @@ apiRouter.post('/equipment', (req: Request, res: Response) => {
     const created = db.prepare('SELECT * FROM equipment WHERE id = ?').get(id);
     res.status(201).json(created);
   } catch (error: any) {
-    if (error && error.message && error.message.includes('UNIQUE constraint failed')) {
+    if (error && error.message && (error.message.includes('UNIQUE constraint failed') || error.message.includes('SQLITE_CONSTRAINT'))) {
       return res.status(400).json({
-        error: 'Já existe um equipamento cadastrado com este nome. Cada equipamento deve ter um nome exclusivo.'
+        error: `Já existe um equipamento cadastrado com o nome "${(req.body?.name || '').trim()}" (ou equivalente). Cada equipamento deve ter um nome exclusivo.`
       });
     }
     res.status(500).json({ error: error.message });
@@ -228,6 +227,7 @@ apiRouter.put('/equipment/:id', (req: Request, res: Response) => {
     db.prepare(`
       UPDATE equipment SET
         name = ?,
+        normalized_name = ?,
         category = ?,
         brand = ?,
         model = ?,
@@ -245,6 +245,7 @@ apiRouter.put('/equipment/:id', (req: Request, res: Response) => {
       WHERE id = ?
     `).run(
       trimmedName,
+      normalizedCandidate,
       b.category,
       b.brand ?? '',
       b.model ?? '',
@@ -265,9 +266,9 @@ apiRouter.put('/equipment/:id', (req: Request, res: Response) => {
     const updated = db.prepare('SELECT * FROM equipment WHERE id = ?').get(id);
     res.json(updated);
   } catch (error: any) {
-    if (error && error.message && error.message.includes('UNIQUE constraint failed')) {
+    if (error && error.message && (error.message.includes('UNIQUE constraint failed') || error.message.includes('SQLITE_CONSTRAINT'))) {
       return res.status(400).json({
-        error: 'Já existe outro equipamento cadastrado com este nome. Cada equipamento deve ter um nome exclusivo.'
+        error: `Já existe outro equipamento cadastrado com o nome "${(req.body?.name || '').trim()}" (ou equivalente). Cada equipamento deve ter um nome exclusivo.`
       });
     }
     res.status(500).json({ error: error.message });
@@ -1763,15 +1764,16 @@ export function restoreBackupData(
     if (Array.isArray(data.equipment)) {
       const insertEq = db.prepare(`
         INSERT OR REPLACE INTO equipment (
-          id, name, category, brand, model, serial_number, acquisition_date,
+          id, name, normalized_name, category, brand, model, serial_number, acquisition_date,
           purchase_value, residual_value, useful_life_years, estimation_method,
           total_useful_hours, annual_hours, notes, is_active, is_deleted, is_sample, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       for (const e of data.equipment) {
         insertEq.run(
           e.id,
           e.name,
+          normalizeEquipmentName(e.name),
           e.category ?? 'Geral',
           e.brand ?? '',
           e.model ?? '',

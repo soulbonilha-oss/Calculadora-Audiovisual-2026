@@ -78,6 +78,85 @@ export function getDbInstance(): DatabaseSync | null {
   return dbInstance;
 }
 
+// Normalização canônica compartilhada de nomes de equipamentos
+export function normalizeEquipmentName(name: string): string {
+  return (name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+export class EquipmentNameConflictError extends Error {
+  public conflicts: Array<{
+    normalized_name: string;
+    count: number;
+    names: string;
+    ids: string;
+  }>;
+
+  constructor(
+    message: string,
+    conflicts: Array<{
+      normalized_name: string;
+      count: number;
+      names: string;
+      ids: string;
+    }>
+  ) {
+    super(message);
+    this.name = 'EquipmentNameConflictError';
+    this.conflicts = conflicts;
+  }
+}
+
+let allowStartupWithConflicts = false;
+
+export function setAllowStartupWithConflicts(allow: boolean): void {
+  allowStartupWithConflicts = allow;
+}
+
+export function getAllowStartupWithConflicts(): boolean {
+  return allowStartupWithConflicts || process.env.ALLOW_STARTUP_WITH_EQUIPMENT_CONFLICTS === 'true';
+}
+
+export function getEquipmentNameConflicts(db: DatabaseSync): Array<{
+  normalized_name: string;
+  count: number;
+  names: string;
+  ids: string;
+}> {
+  const tableInfo = db.prepare('PRAGMA table_info(equipment)').all() as any[];
+  const hasNormCol = tableInfo.some((c: any) => c.name === 'normalized_name');
+
+  if (hasNormCol) {
+    return db.prepare(`
+      SELECT normalized_name, COUNT(*) as count, GROUP_CONCAT(name, ' | ') as names, GROUP_CONCAT(id, ', ') as ids
+      FROM equipment
+      WHERE is_deleted = 0
+      GROUP BY normalized_name
+      HAVING count > 1
+    `).all() as any[];
+  }
+
+  const rows = db.prepare('SELECT id, name FROM equipment WHERE is_deleted = 0').all() as any[];
+  const groups = new Map<string, Array<{ id: string; name: string }>>();
+  for (const r of rows) {
+    const norm = normalizeEquipmentName(r.name);
+    if (!groups.has(norm)) groups.set(norm, []);
+    groups.get(norm)!.push(r);
+  }
+
+  const result: Array<{ normalized_name: string; count: number; names: string; ids: string }> = [];
+  for (const [norm, items] of groups.entries()) {
+    if (items.length > 1) {
+      result.push({
+        normalized_name: norm,
+        count: items.length,
+        names: items.map((i) => i.name).join(' | '),
+        ids: items.map((i) => i.id).join(', '),
+      });
+    }
+  }
+  return result;
+}
+
 export function getDb(): DatabaseSync {
   if (!dbInstance) {
     if (isTestEnvironment()) {
@@ -348,21 +427,180 @@ export function runMigrations(db: DatabaseSync) {
   }
 
   if (!appliedVersions.has(5)) {
-    // Migration 5: Atualização institucional do nome da produtora para 'FBonilha - Produtora Audiovisual'
-    // e criação de índice exclusivo para nomes de equipamentos ativos
-    db.exec(`
+    applyMigration5(db);
+  } else {
+    ensureEquipmentSchemaNormalized(db);
+  }
+}
+
+export function applyMigration5(db: DatabaseSync): void {
+  db.exec('BEGIN TRANSACTION;');
+  try {
+    // 1. Preservação de configurações personalizadas e substituição apenas do valor legado
+    // Atualiza studio_name apenas se for o valor legado 'FBonilha.mov' ou se estiver vazio/nulo.
+    // Qualquer personalização feita pelo usuário é estritamente preservada.
+    db.prepare(`
       UPDATE settings SET
         studio_name = 'FBonilha - Produtora Audiovisual',
         updated_at = datetime('now')
-      WHERE id = 1;
+      WHERE id = 1 AND (studio_name = 'FBonilha.mov' OR studio_name IS NULL OR TRIM(studio_name) = '');
+    `).run();
 
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_equipment_unique_name
-      ON equipment (LOWER(TRIM(name)))
+    // 2. Adiciona a coluna normalized_name à tabela equipment se ainda não existir
+    const tableInfo = db.prepare('PRAGMA table_info(equipment)').all() as any[];
+    const hasNormalizedName = tableInfo.some((col: any) => col.name === 'normalized_name');
+    if (!hasNormalizedName) {
+      db.exec('ALTER TABLE equipment ADD COLUMN normalized_name TEXT;');
+    }
+
+    // 3. Popula a coluna normalized_name para todos os equipamentos existentes usando a mesma regra da API
+    const allEquipment = db.prepare('SELECT id, name FROM equipment').all() as Array<{ id: string; name: string }>;
+    const updateNorm = db.prepare('UPDATE equipment SET normalized_name = ? WHERE id = ?');
+    for (const eq of allEquipment) {
+      const norm = normalizeEquipmentName(eq.name);
+      updateNorm.run(norm, eq.id);
+    }
+
+    // 4. Detecção prévia de duplicidades em registros ativos (is_deleted = 0)
+    const conflicts = db.prepare(`
+      SELECT normalized_name, COUNT(*) as count, GROUP_CONCAT(name, ' | ') as names, GROUP_CONCAT(id, ', ') as ids
+      FROM equipment
+      WHERE is_deleted = 0
+      GROUP BY normalized_name
+      HAVING count > 1
+    `).all() as Array<{ normalized_name: string; count: number; names: string; ids: string }>;
+
+    if (conflicts.length > 0) {
+      if (!getAllowStartupWithConflicts()) {
+        const conflictDetails = conflicts
+          .map(
+            (c) =>
+              `• "${c.normalized_name}": ${c.count} itens com nomes [${c.names}] (IDs: ${c.ids})`
+          )
+          .join('\n');
+
+        const errorMsg =
+          `[MIGRATION 5 CONFLICT] Não foi possível criar o índice de unicidade de equipamentos.\n` +
+          `Foram encontrados nomes duplicados entre equipamentos ativos (is_deleted = 0):\n` +
+          `${conflictDetails}\n\n` +
+          `Estratégia para regularização sem perda de dados:\n` +
+          `1. Atualize os nomes dos equipamentos em duplicidade para identificações exclusivas (ex: "Item 01", "Item 02");\n` +
+          `2. Ou arquive os equipamentos obsoletos marcando is_deleted = 1;\n` +
+          `3. Para iniciar a aplicação em modo de regularização sem aplicar a restrição única temporariamente, ` +
+          `defina a variável ALLOW_STARTUP_WITH_EQUIPMENT_CONFLICTS=true.\n` +
+          `A migração foi revertida (ROLLBACK) e nenhum dado foi alterado ou perdido.`;
+
+        throw new EquipmentNameConflictError(errorMsg, conflicts);
+      } else {
+        console.warn(
+          `[MIGRATION 5 WARNING] Modo de regularização ativo. Existem ${conflicts.length} conflito(s) de nomes entre equipamentos ativos. ` +
+          `O índice único não foi criado e a migração 5 permanecerá pendente até que os nomes sejam regularizados.`
+        );
+        db.exec('COMMIT;');
+        return;
+      }
+    }
+
+    // 5. Se não houver conflitos, cria o índice único canônico e remove o índice simplificado legado
+    db.exec(`
+      DROP INDEX IF EXISTS idx_equipment_unique_name;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_equipment_unique_normalized_name
+      ON equipment (normalized_name)
       WHERE is_deleted = 0;
+
+      CREATE TRIGGER IF NOT EXISTS trg_equipment_set_normalized_name_insert
+      AFTER INSERT ON equipment
+      FOR EACH ROW
+      WHEN NEW.normalized_name IS NULL AND NEW.name IS NOT NULL
+      BEGIN
+        UPDATE equipment
+        SET normalized_name = LOWER(TRIM(NEW.name))
+        WHERE id = NEW.id;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_equipment_set_normalized_name_update
+      AFTER UPDATE OF name ON equipment
+      FOR EACH ROW
+      WHEN NEW.name IS NOT NULL AND (NEW.normalized_name IS NULL OR NEW.normalized_name = OLD.normalized_name)
+      BEGIN
+        UPDATE equipment
+        SET normalized_name = LOWER(TRIM(NEW.name))
+        WHERE id = NEW.id;
+      END;
     `);
 
-    db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, datetime(\'now\'))')
-      .run(5, 'update_studio_name_and_equipment_unique_index');
+    // 6. Registra conclusão da migração
+    db.prepare(`
+      INSERT INTO schema_migrations (version, name, applied_at)
+      VALUES (?, ?, datetime('now'))
+    `).run(5, 'safe_studio_name_and_normalized_equipment_unique_index');
+
+    db.exec('COMMIT;');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK;');
+    } catch (_) {}
+    throw err;
+  }
+}
+
+export function ensureEquipmentSchemaNormalized(db: DatabaseSync): void {
+  const tableInfo = db.prepare('PRAGMA table_info(equipment)').all() as any[];
+  const hasNormalizedName = tableInfo.some((col: any) => col.name === 'normalized_name');
+
+  if (!hasNormalizedName) {
+    db.exec('ALTER TABLE equipment ADD COLUMN normalized_name TEXT;');
+  }
+
+  // Popula se houver valores nulos
+  const nullNorm = db.prepare('SELECT id, name FROM equipment WHERE normalized_name IS NULL').all() as Array<{ id: string; name: string }>;
+  if (nullNorm.length > 0) {
+    const updateNorm = db.prepare('UPDATE equipment SET normalized_name = ? WHERE id = ?');
+    for (const eq of nullNorm) {
+      updateNorm.run(normalizeEquipmentName(eq.name), eq.id);
+    }
+  }
+
+  // Verifica se o índice único já existe
+  const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_equipment_unique_normalized_name'").all();
+  if (indexes.length === 0) {
+    const conflicts = db.prepare(`
+      SELECT normalized_name, COUNT(*) as count
+      FROM equipment
+      WHERE is_deleted = 0
+      GROUP BY normalized_name
+      HAVING count > 1
+    `).all();
+
+    if (conflicts.length === 0) {
+      db.exec(`
+        DROP INDEX IF EXISTS idx_equipment_unique_name;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_equipment_unique_normalized_name
+        ON equipment (normalized_name)
+        WHERE is_deleted = 0;
+
+        CREATE TRIGGER IF NOT EXISTS trg_equipment_set_normalized_name_insert
+        AFTER INSERT ON equipment
+        FOR EACH ROW
+        WHEN NEW.normalized_name IS NULL AND NEW.name IS NOT NULL
+        BEGIN
+          UPDATE equipment
+          SET normalized_name = LOWER(TRIM(NEW.name))
+          WHERE id = NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_equipment_set_normalized_name_update
+        AFTER UPDATE OF name ON equipment
+        FOR EACH ROW
+        WHEN NEW.name IS NOT NULL AND (NEW.normalized_name IS NULL OR NEW.normalized_name = OLD.normalized_name)
+        BEGIN
+          UPDATE equipment
+          SET normalized_name = LOWER(TRIM(NEW.name))
+          WHERE id = NEW.id;
+        END;
+      `);
+    }
   }
 }
 
