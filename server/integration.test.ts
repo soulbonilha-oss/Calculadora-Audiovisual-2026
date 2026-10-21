@@ -3017,6 +3017,24 @@ test('MIG5.10 - Preservação dos registros arquivados (is_deleted = 1) e coexis
   }
 });
 
+test('MIG5.11 - Banco legado sem registro de configuração (settings vazio) cria id=1 com FBonilha - Produtora Audiovisual', () => {
+  const db = createLegacyV4Database();
+  try {
+    // Remove o registro de settings para simular um banco sem configuração inicial
+    db.prepare('DELETE FROM settings').run();
+    assert.equal((db.prepare('SELECT count(*) as c FROM settings').get() as any).c, 0);
+
+    runMigrations(db);
+
+    const settings = db.prepare('SELECT * FROM settings WHERE id = 1').get() as any;
+    assert.ok(settings, 'Registro de configuração deve ser criado');
+    assert.equal(settings.studio_name, 'FBonilha - Produtora Audiovisual', 'Nome institucional deve ser FBonilha - Produtora Audiovisual');
+  } finally {
+    db.close();
+  }
+});
+
+
 
 
 

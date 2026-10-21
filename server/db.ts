@@ -437,14 +437,21 @@ export function applyMigration5(db: DatabaseSync): void {
   db.exec('BEGIN TRANSACTION;');
   try {
     // 1. Preservação de configurações personalizadas e substituição apenas do valor legado
-    // Atualiza studio_name apenas se for o valor legado 'FBonilha.mov' ou se estiver vazio/nulo.
-    // Qualquer personalização feita pelo usuário é estritamente preservada.
-    db.prepare(`
-      UPDATE settings SET
-        studio_name = 'FBonilha - Produtora Audiovisual',
-        updated_at = datetime('now')
-      WHERE id = 1 AND (studio_name = 'FBonilha.mov' OR studio_name IS NULL OR TRIM(studio_name) = '');
-    `).run();
+    // Considera bancos sem registro de configuração e mantém o comportamento correto de criação das configurações.
+    const existingSettings = db.prepare('SELECT id, studio_name FROM settings WHERE id = 1').get() as { id: number; studio_name?: string } | undefined;
+    if (!existingSettings) {
+      db.prepare(`
+        INSERT INTO settings (id, studio_name, updated_at)
+        VALUES (1, 'FBonilha - Produtora Audiovisual', datetime('now'))
+      `).run();
+    } else if (existingSettings.studio_name === 'FBonilha.mov' || !existingSettings.studio_name || existingSettings.studio_name.trim() === '') {
+      db.prepare(`
+        UPDATE settings SET
+          studio_name = 'FBonilha - Produtora Audiovisual',
+          updated_at = datetime('now')
+        WHERE id = 1;
+      `).run();
+    }
 
     // 2. Adiciona a coluna normalized_name à tabela equipment se ainda não existir
     const tableInfo = db.prepare('PRAGMA table_info(equipment)').all() as any[];
@@ -534,7 +541,7 @@ export function applyMigration5(db: DatabaseSync): void {
     db.prepare(`
       INSERT INTO schema_migrations (version, name, applied_at)
       VALUES (?, ?, datetime('now'))
-    `).run(5, 'safe_studio_name_and_normalized_equipment_unique_index');
+    `).run(5, 'update_studio_name_and_equipment_unique_index');
 
     db.exec('COMMIT;');
   } catch (err) {
@@ -546,6 +553,22 @@ export function applyMigration5(db: DatabaseSync): void {
 }
 
 export function ensureEquipmentSchemaNormalized(db: DatabaseSync): void {
+  // Garante registro de settings e preservação de nomes personalizados
+  const existingSettings = db.prepare('SELECT id, studio_name FROM settings WHERE id = 1').get() as { id: number; studio_name?: string } | undefined;
+  if (!existingSettings) {
+    db.prepare(`
+      INSERT INTO settings (id, studio_name, updated_at)
+      VALUES (1, 'FBonilha - Produtora Audiovisual', datetime('now'))
+    `).run();
+  } else if (existingSettings.studio_name === 'FBonilha.mov' || !existingSettings.studio_name || existingSettings.studio_name.trim() === '') {
+    db.prepare(`
+      UPDATE settings SET
+        studio_name = 'FBonilha - Produtora Audiovisual',
+        updated_at = datetime('now')
+      WHERE id = 1;
+    `).run();
+  }
+
   const tableInfo = db.prepare('PRAGMA table_info(equipment)').all() as any[];
   const hasNormalizedName = tableInfo.some((col: any) => col.name === 'normalized_name');
 
