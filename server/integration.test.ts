@@ -31,6 +31,7 @@ import {
 } from './db.js';
 import { generateCommercialProposalPdf } from '../src/utils/pdfGenerator.js';
 import { calculateProjectPricing } from '../src/financial/engine.js';
+import { CATEGORIES } from '../src/components/equipment/EquipmentView.js';
 
 import { withTestServer } from './test-helpers.js';
 
@@ -2429,6 +2430,263 @@ test('EQ1.7 - Identificação institucional da produtora FBonilha - Produtora Au
     assert.equal(resProp.status, 201);
     const prop = await resProp.json();
     assert.equal(prop.issuerContact.studioName, 'FBonilha - Produtora Audiovisual');
+  });
+});
+
+test('PDF1.1 - Geração de proposta comercial em PDF renderiza o novo nome institucional FBonilha - Produtora Audiovisual', () => {
+  const proposalData = {
+    proposalCode: 'PROP-2026-FBN',
+    clientName: 'Cliente Audiovisual SP',
+    clientCompany: 'Empresa Audiovisual Ltda',
+    projectTitle: 'Vídeo Institucional 4K',
+    scopeSummary: 'Captação externa com 2 diárias e pós-produção completa com color grading',
+    commercialHours: { preProductionHours: 4, productionHours: 12, postProductionHours: 16 },
+    totalPrice: 15000,
+    cashDiscountPct: 10,
+    cashPrice: 13500,
+    installmentCount: 4,
+    installmentValue: 3750,
+    issueDate: '2026-10-21',
+    validUntilDate: '2026-10-28',
+    settings: {
+      id: 1,
+      studio_name: 'FBonilha - Produtora Audiovisual',
+      primary_color: '#4F5D47',
+      email: 'contato@fbonilha.com.br',
+      phone: '(11) 98765-4321',
+      website: 'www.fbonilha.com.br',
+      cnpj: '12.345.678/0001-90',
+      address: 'São Paulo, SP',
+      default_hourly_rate: 150,
+      default_billable_hours_month: 100,
+      default_pricing_method: 'margin_on_sale',
+      default_profit_margin_pct: 25,
+      default_markup_pct: 35,
+      default_tax_pct: 6,
+      default_financial_fee_pct: 2.5,
+      default_fixed_fee: 0,
+      default_cash_discount_pct: 10,
+      default_installments: 4,
+      proposal_valid_days: 7,
+      default_notes: 'Notas comerciais',
+      terms_and_conditions: 'Termos comerciais',
+      updated_at: '2026-10-21',
+    } as any,
+  };
+
+  const doc = generateCommercialProposalPdf(proposalData as any);
+  assert.ok(doc, 'Instância de jsPDF criada com sucesso');
+  const rawOutput = doc.output();
+  assert.ok(rawOutput.includes('FBonilha - Produtora Audiovisual'), 'PDF deve conter o novo nome institucional no documento');
+  assert.ok(rawOutput.includes('PROP-2026-FBN'), 'PDF deve conter o código da proposta');
+  assert.ok(rawOutput.includes('Cliente Audiovisual SP'), 'PDF deve conter o nome do cliente');
+});
+
+test('PDF1.2 - Geração de proposta comercial em PDF aplica fallback para FBonilha - Produtora Audiovisual quando studio_name estiver vazio ou com espaços', () => {
+  const emptyCases = ['', '   ', undefined, null];
+
+  for (const emptyVal of emptyCases) {
+    const proposalData = {
+      proposalCode: 'PROP-2026-FALLBACK',
+      clientName: 'Cliente Sem Studio Name',
+      projectTitle: 'Campanha Publicitária',
+      scopeSummary: 'Produção executiva e gravação',
+      commercialHours: { preProductionHours: 2, productionHours: 6, postProductionHours: 8 },
+      totalPrice: 5000,
+      cashDiscountPct: 10,
+      cashPrice: 4500,
+      installmentCount: 2,
+      installmentValue: 2500,
+      issueDate: '2026-10-21',
+      validUntilDate: '2026-10-28',
+      settings: {
+        id: 1,
+        studio_name: emptyVal as any,
+        primary_color: '#4F5D47',
+      } as any,
+    };
+
+    const doc = generateCommercialProposalPdf(proposalData as any);
+    const rawOutput = doc.output();
+    assert.ok(
+      rawOutput.includes('FBonilha - Produtora Audiovisual'),
+      `PDF deve usar fallback institucional FBonilha - Produtora Audiovisual quando studio_name for ${JSON.stringify(emptyVal)}`
+    );
+  }
+});
+
+test('PDF1.3 - Geração de proposta comercial em PDF preserva nome de estúdio customizado quando fornecido', () => {
+  const proposalData = {
+    proposalCode: 'PROP-2026-CUSTOM',
+    clientName: 'Cliente Custom',
+    projectTitle: 'Vídeo Promocional',
+    scopeSummary: 'Gravação institucional',
+    commercialHours: { preProductionHours: 1, productionHours: 4, postProductionHours: 4 },
+    totalPrice: 3000,
+    cashDiscountPct: 5,
+    cashPrice: 2850,
+    installmentCount: 3,
+    installmentValue: 1000,
+    issueDate: '2026-10-21',
+    validUntilDate: '2026-10-28',
+    settings: {
+      id: 1,
+      studio_name: 'Estúdio CineLab 2026',
+      primary_color: '#10B981',
+    } as any,
+  };
+
+  const doc = generateCommercialProposalPdf(proposalData as any);
+  const rawOutput = doc.output();
+  assert.ok(rawOutput.includes('Estúdio CineLab 2026'), 'PDF deve exibir o nome do estúdio customizado');
+});
+
+test('EQ1.8 - Categoria Baterias disponível na lista de categorias do catálogo e utilizável no fluxo de orçamento', async () => {
+  // 1. Verifica disponibilidade na lista oficial de categorias
+  assert.ok(CATEGORIES.includes('Baterias'), 'A categoria "Baterias" deve constar na constante CATEGORIES');
+
+  await withTestServer(async ({ baseUrl }) => {
+    // 2. Cria equipamento na categoria Baterias
+    const batPayload = {
+      name: 'Kit 4x Baterias Sony NP-FZ100',
+      category: 'Baterias',
+      brand: 'Sony',
+      model: 'NP-FZ100',
+      purchase_value: 2000,
+      residual_value: 200,
+      useful_life_years: 2,
+      estimation_method: 'total_hours',
+      total_useful_hours: 1800,
+      annual_hours: 900,
+      is_active: 1,
+    };
+
+    const resBat = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(batPayload),
+    });
+    assert.equal(resBat.status, 201);
+    const bat = await resBat.json();
+    assert.equal(bat.category, 'Baterias');
+
+    // 3. Consulta catálogo de equipamentos para simular fluxo de seleção no orçamento
+    const resCatalog = await fetch(`${baseUrl}/equipment`);
+    assert.equal(resCatalog.status, 200);
+    const catalog = await resCatalog.json();
+    const batteryItems = catalog.filter((e: any) => e.category === 'Baterias');
+    assert.ok(batteryItems.length >= 1, 'Deve haver ao menos um item sob categoria Baterias');
+
+    // 4. Seleciona a bateria para um orçamento com 12 horas de uso
+    const budgetPayload = {
+      title: 'Projeto Publicitário - Captação com Baterias',
+      client_name: 'Agência Criativa',
+      equipment: [
+        {
+          equipment_id: bat.id,
+          name: bat.name,
+          category: bat.category,
+          hours_used: 12,
+          hourly_depreciation: 1.0,
+          total_depreciation: 12.0,
+        },
+      ],
+      calculatedSummary: {
+        totalEquipmentCost: 12.0,
+        finalBasePrice: 4500,
+      },
+    };
+
+    const resBudget = await fetch(`${baseUrl}/budgets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(budgetPayload),
+    });
+    assert.equal(resBudget.status, 201);
+    const createdBudget = await resBudget.json();
+    assert.ok(createdBudget.id);
+    assert.equal(createdBudget.equipment.length, 1);
+    assert.equal(createdBudget.equipment[0].category, 'Baterias');
+    assert.equal(createdBudget.equipment[0].name, 'Kit 4x Baterias Sony NP-FZ100');
+    assert.equal(createdBudget.equipment[0].total_depreciation, 12.0);
+  });
+});
+
+test('EQ1.9 - Duplicação de equipamento preserva todos os parâmetros com ID distinto e impede nome duplicado', async () => {
+  await withTestServer(async ({ baseUrl }) => {
+    // 1. Cadastra equipamento original com todos os parâmetros detalhados
+    const originalItem = {
+      name: 'Luz LED Aputure 300d II',
+      category: 'Iluminação',
+      brand: 'Aputure',
+      model: 'LS C300d II',
+      serial_number: 'SN-AP-300D-01',
+      purchase_value: 8500,
+      residual_value: 1500,
+      useful_life_years: 4,
+      estimation_method: 'total_hours',
+      total_useful_hours: 4000,
+      annual_hours: 1000,
+      notes: 'Kit completo com refletor e bag',
+      is_active: 1,
+    };
+
+    const resOrig = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(originalItem),
+    });
+    assert.equal(resOrig.status, 201);
+    const orig = await resOrig.json();
+
+    // 2. Tentar duplicar com exatamente o mesmo nome deve ser rejeitado (400)
+    const resDupSameName = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...orig,
+        id: undefined, // Simula tentativa de criar novo item
+      }),
+    });
+    assert.equal(resDupSameName.status, 400, 'Servidor deve rejeitar duplicação com nome idêntico');
+
+    // 3. Duplicar com novo nome exclusivo preservando todos os demais parâmetros
+    const resDupSuccess = await fetch(`${baseUrl}/equipment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Luz LED Aputure 300d II Unidade 02',
+        category: orig.category,
+        brand: orig.brand,
+        model: orig.model,
+        serial_number: 'SN-AP-300D-02',
+        purchase_value: orig.purchase_value,
+        residual_value: orig.residual_value,
+        useful_life_years: orig.useful_life_years,
+        estimation_method: orig.estimation_method,
+        total_useful_hours: orig.total_useful_hours,
+        annual_hours: orig.annual_hours,
+        notes: orig.notes,
+        is_active: orig.is_active,
+      }),
+    });
+    assert.equal(resDupSuccess.status, 201);
+    const dup = await resDupSuccess.json();
+
+    // Verificações
+    assert.notEqual(dup.id, orig.id, 'IDs devem ser obrigatoriamente distintos');
+    assert.equal(dup.name, 'Luz LED Aputure 300d II Unidade 02');
+    assert.equal(dup.category, orig.category);
+    assert.equal(dup.purchase_value, orig.purchase_value);
+    assert.equal(dup.residual_value, orig.residual_value);
+    assert.equal(dup.useful_life_years, orig.useful_life_years);
+    assert.equal(dup.estimation_method, orig.estimation_method);
+    assert.equal(dup.total_useful_hours, orig.total_useful_hours);
+    assert.equal(dup.annual_hours, orig.annual_hours);
+    assert.equal(dup.brand, orig.brand);
+    assert.equal(dup.model, orig.model);
+    assert.equal(dup.notes, orig.notes);
+    assert.equal(dup.is_active, orig.is_active);
   });
 });
 

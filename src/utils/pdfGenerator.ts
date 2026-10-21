@@ -38,7 +38,7 @@ export function generateCommercialProposalPdf(data: CommercialProposalData): jsP
   const margin = 20;
   const contentWidth = pageWidth - margin * 2;
 
-  // Paleta oficial FBonilha.mov (Manifesto)
+  // Paleta oficial FBonilha - Produtora Audiovisual
   const primaryColor = data.settings.primary_color || '#4F5D47'; // Verde Musgo Cinematográfico
   const petrolColor = '#2F5C61'; // Azul Petróleo
   const terracottaColor = '#A55C3B'; // Terracota Queimado
@@ -46,6 +46,9 @@ export function generateCommercialProposalPdf(data: CommercialProposalData): jsP
   const mutedTextColor = '#595550'; // Grafite Secundário
   const lightBgColor = '#FAF8F5'; // Marfim Quente Suave
   const cardBorderColor = '#E8E2D6'; // Borda Linho / Marfim
+
+  // Nome institucional garantido: se vazio, nulo ou apenas espaços, usa 'FBonilha - Produtora Audiovisual'
+  const studioDisplayName = (data.settings?.studio_name || '').trim() || 'FBonilha - Produtora Audiovisual';
 
   // 1. Top Decorative Bar em Verde Musgo
   doc.setFillColor(primaryColor);
@@ -57,7 +60,7 @@ export function generateCommercialProposalPdf(data: CommercialProposalData): jsP
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(22);
   doc.setTextColor(primaryColor);
-  doc.text(data.settings.studio_name || 'FBonilha - Produtora Audiovisual', margin, currentY);
+  doc.text(studioDisplayName, margin, currentY);
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(9);
@@ -298,7 +301,7 @@ export function generateCommercialProposalPdf(data: CommercialProposalData): jsP
   doc.setFontSize(7.5);
   doc.setTextColor(mutedTextColor);
   doc.text(
-    `${data.settings.studio_name || 'FBonilha - Produtora Audiovisual'}  ·  Documento oficial gerado localmente em ${formatDateBR(data.issueDate)}`,
+    `${studioDisplayName}  ·  Documento oficial gerado localmente em ${formatDateBR(data.issueDate)}`,
     margin,
     pageHeight - 10
   );

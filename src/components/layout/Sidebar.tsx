@@ -71,10 +71,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
             FB
           </div>
           <div className="min-w-0">
-            <h1 className="text-base font-bold text-slate-900 tracking-tight truncate">
+            <h1 className="text-sm font-bold text-slate-900 tracking-tight leading-snug">
               {settings?.studio_name || 'FBonilha - Produtora Audiovisual'}
             </h1>
-            <p className="text-xs text-slate-500 truncate">Produtora Audiovisual &amp; Precificação</p>
+            <p className="text-[11px] text-slate-500 truncate">Orçamentos &amp; Precificação</p>
           </div>
         </div>
 
